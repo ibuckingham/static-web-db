@@ -1,49 +1,72 @@
+use std::collections::HashMap;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{header, Body, Method, Request, Response, Server, StatusCode};
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use hyper::server::conn::AddrStream;
 
-async fn get_response(req: Request<Body>) -> hyper::http::Result<Response<Body>> {
+#[derive(Clone)]
+struct Repository {
+    // shared read-only map of the paths to body content
+    files: Arc<HashMap<&'static str, &'static str>>
+}
+
+impl Repository {
+    fn new() -> Repository {
+        let mut files: HashMap<&'static str, &'static str> = HashMap::new();
+        let index_body = "<!DOCTYPE html><title>Iain's Blog</title><p>index of posts from hashmap";
+        files.insert("/", index_body);
+        files.insert("/index", index_body);
+        files.insert("/about", "<!DOCTYPE html><title>Iain's Blog</title><p>About this blog - hashmap");
+        Repository { files: Arc::new(files) }
+    }
+
+    fn get_response_for_path(&self, path: &str) -> hyper::http::Result<Response<Body>> {
+        match self.files.get(path) {
+            None => {
+                Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::empty())
+            }
+            Some(&body) => {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "text/html; charset=UTF-8")
+                    .body(Body::from(body))
+            }
+        }
+    }
+}
+
+async fn get_response(repository: Repository, req: Request<Body>) -> hyper::http::Result<Response<Body>> {
     // only allow GET methods
     match (req.method(), req.uri().path()) {
-        (&Method::GET, path) => get_get_response(path),
+        (&Method::GET, path) => repository.get_response_for_path(path),
         _ => Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .body(Body::empty()),
     }
 }
 
-fn get_get_response(path: &str) -> hyper::http::Result<Response<Body>> {
-    match path {
-        "/" | "/index" => Response::builder()
-            .header(header::CONTENT_TYPE, "text/html; charset=UTF-8")
-            .body(Body::from(
-                "<!DOCTYPE html><title>Iain's Blog</title><p>index of posts",
-            )),
-        "/about" => Response::builder()
-            .header(header::CONTENT_TYPE, "text/html; charset=UTF-8")
-            .body(Body::from(
-                "<!DOCTYPE html><title>Iain's Blog</title><p>About this blog",
-            )),
-        _ => Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::empty()),
-    }
-}
-
 #[tokio::main]
 async fn main() {
-    // We'll bind to 127.0.0.1:8080
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+    let repository = Repository::new();
 
     // A `Service` is needed for every connection, so this
     // creates one
-    let make_svc = make_service_fn(|_conn| async {
-        // service_fn converts our function into a `Service`
-        Ok::<_, Infallible>(service_fn(get_response))
+    let make_service = make_service_fn(|_conn: &AddrStream| {
+        let repository = repository.clone();
+        let service = service_fn(move |req| {
+            get_response(repository.clone(), req)
+        });
+
+        // return the service to hyper
+        async move {Ok::<_, Infallible>(service)}
     });
 
-    let server = Server::bind(&addr).serve(make_svc);
+    // We'll bind to 127.0.0.1:8080
+    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+    let server = Server::bind(&addr).serve(make_service);
 
     // Run this server for... forever!
     if let Err(e) = server.await {
