@@ -8,3 +8,5 @@ edition = "2021"
 [dependencies]
 hyper = { version = "0.14.17", features = ["server", "tcp", "http1"] }
 tokio = { version = "1.17.0", features = ["macros", "rt", "rt-multi-thread", "net"] }
+rusqlite = "0.27.0"
+chrono = "0.4"
