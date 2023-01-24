@@ -2,45 +2,39 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{header, Body, Method, Request, Response, Server, StatusCode};
-use rusqlite::Connection;
-use std::collections::HashMap;
+use rusqlite::{Connection, OptionalExtension};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 struct Repository {
-    // shared read-only map of the paths to body content
-    files: Arc<HashMap<&'static str, &'static str>>,
-    conn: Arc<Mutex<Connection>>,
+    // Std::Mutex means grabbing a lock on every request
+    // Tokio::Mutex might be more concurrent alternative, if needed
+    // ... or create multiple connections in a pool?
+    conn_shared: Arc<Mutex<Connection>>,
 }
 
 impl Repository {
     fn new() -> Repository {
         let conn = Connection::open("site.db").expect("connect to db");
 
-        let mut files: HashMap<&'static str, &'static str> = HashMap::new();
-        let index_body = "<!DOCTYPE html><title>Iain's Blog</title><p>index of posts from hashmap";
-        files.insert("/", index_body);
-        files.insert("/index", index_body);
-        files.insert(
-            "/about",
-            "<!DOCTYPE html><title>Iain's Blog</title><p>About this blog - hashmap",
-        );
         Repository {
-            files: Arc::new(files),
-            conn: Arc::new(Mutex::new(conn)),
+            conn_shared: Arc::new(Mutex::new(conn)),
         }
     }
 
     fn get_response_for_path(&self, path: &str) -> hyper::http::Result<Response<Body>> {
-        let last_modified_text = Self::query_last_modified(&self.conn);
+        let last_modified_text = Self::query_last_modified(&self.conn_shared);
 
-        match self.files.get(path) {
-            None => Response::builder()
+        match Self::query_body(&self.conn_shared, path) {
+            Err(_) => Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::empty()),
+            Ok(None) => Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::empty()),
-            Some(&body) => Response::builder()
+            Ok(Some(body)) => Response::builder()
                 .header(header::CONTENT_TYPE, "text/html; charset=UTF-8")
                 .header(header::LAST_MODIFIED, last_modified_text)
                 .body(Body::from(body)),
@@ -69,6 +63,17 @@ impl Repository {
             .expect("SQL statement preparable");
 
         stmt.query_row([], |row| row.get(0)).expect("db queryable")
+    }
+
+    fn query_body(conn: &Arc<Mutex<Connection>>, path: &str) -> rusqlite::Result<Option<String>> {
+        let conn_locked = conn
+            .lock().unwrap();
+
+        let mut stmt = conn_locked
+            .prepare("select body from pages where path = ?")
+            .expect("SQL statement preparable");
+
+        stmt.query_row([path], |row| row.get(0)).optional()
     }
 }
 
