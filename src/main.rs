@@ -25,26 +25,47 @@ impl Repository {
     }
 
     fn get_response_for_path(&self, path: &str) -> hyper::http::Result<Response<Body>> {
-        let last_modified_text = Self::query_last_modified(&self.conn_shared);
-
         match Self::query_body(&self.conn_shared, path) {
-            Err(_) => Response::builder()
+            Err(e) => Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::empty()),
+                .body(Body::from(e.to_string())),
             Ok(None) => Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::empty()),
             Ok(Some(body)) => Response::builder()
                 .header(header::CONTENT_TYPE, "text/html; charset=UTF-8")
-                .header(header::LAST_MODIFIED, last_modified_text)
-                .body(Body::from(body)),
+                .header(header::LAST_MODIFIED, body.format_last_modified_timestamp())
+                .body(Body::from(body.body)),
         }
     }
 
-    fn query_last_modified(conn: &Arc<Mutex<Connection>>) -> String {
-        let last_modified_uxt = Self::query_last_modified_utx(conn);
+    fn query_body(conn: &Arc<Mutex<Connection>>, path: &str) -> rusqlite::Result<Option<PageData>> {
+        let conn_locked = conn.lock().unwrap();
 
-        let last_modified_timestamp = NaiveDateTime::from_timestamp_opt(last_modified_uxt, 0)
+        let mut stmt = conn_locked
+            .prepare("select last_modified_uxt, body from pages where path = ?")
+            .expect("SQL statement preparable");
+
+        stmt.query_row([path], |row| {
+            let lm = row.get(0)?;
+            let b = row.get(1)?;
+            Ok(PageData {
+                last_modified_uxt: lm,
+                body: b,
+            })
+        })
+        .optional()
+    }
+}
+
+struct PageData {
+    last_modified_uxt: i64,
+    body: Vec<u8>,
+}
+
+impl PageData {
+    fn format_last_modified_timestamp(&self) -> String {
+        let last_modified_timestamp = NaiveDateTime::from_timestamp_opt(self.last_modified_uxt, 0)
             .expect("timestamp i64 within range");
         let last_modified_date_time: DateTime<Utc> =
             DateTime::from_utc(last_modified_timestamp, Utc);
@@ -52,28 +73,6 @@ impl Repository {
         last_modified_date_time
             .format("%a, %d %b %Y %H:%M:%S GMT")
             .to_string()
-    }
-
-    fn query_last_modified_utx(conn: &Arc<Mutex<Connection>>) -> i64 {
-        let conn_locked = conn
-            .lock().unwrap();
-
-        let mut stmt = conn_locked
-            .prepare("select last_modified_uxt from properties")
-            .expect("SQL statement preparable");
-
-        stmt.query_row([], |row| row.get(0)).expect("db queryable")
-    }
-
-    fn query_body(conn: &Arc<Mutex<Connection>>, path: &str) -> rusqlite::Result<Option<String>> {
-        let conn_locked = conn
-            .lock().unwrap();
-
-        let mut stmt = conn_locked
-            .prepare("select body from pages where path = ?")
-            .expect("SQL statement preparable");
-
-        stmt.query_row([path], |row| row.get(0)).optional()
     }
 }
 
