@@ -32,10 +32,10 @@ impl Repository {
             Ok(None) => Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::empty()),
-            Ok(Some(body)) => Response::builder()
-                .header(header::CONTENT_TYPE, "text/html; charset=UTF-8")
-                .header(header::LAST_MODIFIED, body.format_last_modified_timestamp())
-                .body(Body::from(body.body)),
+            Ok(Some(page)) => Response::builder()
+                .header(header::CONTENT_TYPE, &page.content_type)
+                .header(header::LAST_MODIFIED, page.format_last_modified_timestamp())
+                .body(Body::from(page.body)),
         }
     }
 
@@ -43,14 +43,16 @@ impl Repository {
         let conn_locked = conn.lock().unwrap();
 
         let mut stmt = conn_locked
-            .prepare("select last_modified_uxt, body from pages where path = ?")
+            .prepare("select last_modified_uxt, content_type, body from pages where path = ?")
             .expect("SQL statement preparable");
 
         stmt.query_row([path], |row| {
             let lm = row.get(0)?;
-            let b = row.get(1)?;
+            let ct = row.get(1)?;
+            let b = row.get(2)?;
             Ok(PageData {
                 last_modified_uxt: lm,
+                content_type: ct,
                 body: b,
             })
         })
@@ -60,6 +62,7 @@ impl Repository {
 
 struct PageData {
     last_modified_uxt: i64,
+    content_type: String,
     body: Vec<u8>,
 }
 
