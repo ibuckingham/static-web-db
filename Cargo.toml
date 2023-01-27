@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-hyper = { version = "0.14.17", features = ["server", "tcp", "http1"] }
-tokio = { version = "1.17.0", features = ["macros", "rt", "rt-multi-thread", "net"] }
-rusqlite = "0.27.0"
+hyper = { version = "0.14", features = ["server", "tcp", "http1"] }
+tokio = { version = "1.24", features = ["macros", "rt", "rt-multi-thread", "net"] }
+rusqlite = { version = "0.28", features = ["blob"] }
 chrono = "0.4"
