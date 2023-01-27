@@ -6,6 +6,7 @@ use rusqlite::{Connection, OptionalExtension};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use hyper::body::Bytes;
 
 #[derive(Clone)]
 struct Repository {
@@ -25,48 +26,53 @@ impl Repository {
     }
 
     fn get_response_for_path(&self, path: &str) -> hyper::http::Result<Response<Body>> {
-        match Self::query_body(&self.conn_shared, path) {
-            Err(e) => Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from(e.to_string())),
-            Ok(None) => Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::empty()),
-            Ok(Some(page)) => Response::builder()
-                .header(header::CONTENT_TYPE, &page.content_type)
-                .header(header::LAST_MODIFIED, page.format_last_modified_timestamp())
-                .body(Body::from(page.body)),
-        }
-    }
-
-    fn query_body(conn: &Arc<Mutex<Connection>>, path: &str) -> rusqlite::Result<Option<PageData>> {
+        let conn = &self.conn_shared;
         let conn_locked = conn.lock().unwrap();
 
         let mut stmt = conn_locked
             .prepare("select last_modified_uxt, content_type, body from pages where path = ?")
             .expect("SQL statement preparable");
 
-        stmt.query_row([path], |row| {
+        let mut b: Option<Bytes> = None;
+
+        let page_data = stmt.query_row([path], |row| {
             let lm = row.get(0)?;
             let ct = row.get(1)?;
-            let b = row.get(2)?;
-            Ok(PageData {
+            let bv: Vec<u8> = row.get(2)?;
+            b = Some(Bytes::from(bv));
+            Ok(PageHeaders {
                 last_modified_uxt: lm,
                 content_type: ct,
-                body: b,
             })
-        })
-        .optional()
+        }).optional();
+
+        match page_data {
+            Err(e) => Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(e.to_string())),
+            Ok(None) => Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty()),
+            Ok(Some(page)) => {
+                let chunks: Vec<Result<_, std::io::Error>> = vec![Ok(b.unwrap())];
+
+                let response = Response::builder()
+                    .header(header::CONTENT_TYPE, &page.content_type)
+                    .header(header::LAST_MODIFIED, page.format_last_modified_timestamp())
+                    .body(Body::wrap_stream(futures_util::stream::iter(chunks)));
+
+                return response;
+            },
+        }
     }
 }
 
-struct PageData {
+struct PageHeaders {
     last_modified_uxt: i64,
     content_type: String,
-    body: Vec<u8>,
 }
 
-impl PageData {
+impl PageHeaders {
     fn format_last_modified_timestamp(&self) -> String {
         let last_modified_timestamp = NaiveDateTime::from_timestamp_opt(self.last_modified_uxt, 0)
             .expect("timestamp i64 within range");
