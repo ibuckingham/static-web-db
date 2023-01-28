@@ -2,7 +2,8 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{header, Body, Method, Request, Response, Server, StatusCode};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, DatabaseName, OptionalExtension};
+use rusqlite::blob::Blob;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -30,16 +31,17 @@ impl Repository {
         let conn_locked = conn.lock().unwrap();
 
         let mut stmt = conn_locked
-            .prepare("select last_modified_uxt, content_type, body from pages where path = ?")
+            .prepare("select last_modified_uxt, content_type, rowid, length(body) as content_length from pages where path = ?")
             .expect("SQL statement preparable");
 
-        let mut b: Option<Bytes> = None;
+        let mut row_id: i64 = 0;
+        let mut content_length = 0;
 
         let page_data = stmt.query_row([path], |row| {
             let lm = row.get(0)?;
             let ct = row.get(1)?;
-            let bv: Vec<u8> = row.get(2)?;
-            b = Some(Bytes::from(bv));
+            row_id = row.get(2)?;
+            content_length = row.get(3)?;
             Ok(PageHeaders {
                 last_modified_uxt: lm,
                 content_type: ct,
@@ -54,7 +56,25 @@ impl Repository {
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::empty()),
             Ok(Some(page)) => {
-                let chunks: Vec<Result<_, std::io::Error>> = vec![Ok(b.unwrap())];
+
+                let body_blob: Blob = conn_locked.blob_open(
+                    DatabaseName::Main,
+                    "pages",
+                    "body",
+                    row_id,
+                    true
+                ).expect("open body blob");
+
+                let mut buf: Vec<u8> = Vec::with_capacity(content_length);
+                buf.resize(content_length, 0);
+                let read_length = body_blob.read_at(&mut buf, 0).expect("read body blob");
+                let bytes = if read_length == buf.len() {
+                    Bytes::from(buf)
+                } else {
+                    Bytes::copy_from_slice(&buf[0..read_length])
+                };
+
+                let chunks: Vec<Result<_, std::io::Error>> = vec!(Ok(bytes));
 
                 let response = Response::builder()
                     .header(header::CONTENT_TYPE, &page.content_type)
