@@ -8,7 +8,7 @@ use rusqlite::blob::Blob;
 use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::{Arc};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 #[derive(Clone)]
@@ -20,7 +20,7 @@ struct Repository {
 }
 
 struct SqlRequest {
-    response_sender: oneshot::Sender<Vec<u8>>,
+    page_sender: oneshot::Sender<PageContent>,
 }
 
 impl Repository {
@@ -40,27 +40,28 @@ impl Repository {
         let conn = &self.conn_shared;
         let conn_locked = conn.lock().await;
 
-        let (page_data, row_id, content_length) = {
+        let (sql_request_sender, mut sql_request_receiver) = mpsc::channel::<SqlRequest>(1);
+
+        let page_data = {
             let mut stmt = conn_locked
                 .prepare("select last_modified_uxt, content_type, rowid, length(body) as content_length from pages where path = ?")
                 .expect("SQL statement preparable");
 
-            let mut row_id: i64 = 0;
-            let mut content_length = 0;
+            stmt.query_row([path], |row| {
+                let lm = row.get(0)?;
+                let ct = row.get(1)?;
+                let row_id = row.get(2)?;
+                let content_length = row.get(3)?;
 
-            let pd = stmt
-                .query_row([path], |row| {
-                    let lm = row.get(0)?;
-                    let ct = row.get(1)?;
-                    row_id = row.get(2)?;
-                    content_length = row.get(3)?;
-                    Ok(PageHeaders {
-                        last_modified_uxt: lm,
-                        content_type: ct,
-                    })
+                Ok(PageContent {
+                    last_modified_uxt: lm,
+                    content_type: ct,
+                    content_length: content_length,
+                    row_id: row_id,
+                    body: Vec::new(),
                 })
-                .optional();
-            (pd, row_id, content_length)
+            })
+            .optional()
         };
 
         match page_data {
@@ -70,31 +71,36 @@ impl Repository {
             Ok(None) => Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::empty()),
-            Ok(Some(page)) => {
-                let (sql_tx, mut sql_rx) = mpsc::channel::<SqlRequest>(1);
-
+            Ok(Some(mut page)) => {
                 {
                     let body_blob: Blob = conn_locked
-                        .blob_open(DatabaseName::Main, "pages", "body", row_id, true)
+                        .blob_open(DatabaseName::Main, "pages", "body", page.row_id, true)
                         .expect("open body blob");
 
-                    let mut buf: Vec<u8> = Vec::with_capacity(content_length);
-                    buf.resize(content_length, 0);
+                    let mut buf: Vec<u8> = Vec::with_capacity(page.content_length);
+                    buf.resize(page.content_length, 0);
                     let read_length = body_blob.read_at(&mut buf, 0).expect("read body blob");
                     buf.resize(read_length, 0);
+                    page.body = buf;
 
                     let _t_sender = tokio::spawn(async move {
-                        if let Some(request) = sql_rx.recv().await {
-                            let _ = request.response_sender.send(buf);
+                        if let Some(request) = sql_request_receiver.recv().await {
+                            let _ = request.page_sender.send(page);
                         }
                     });
                 };
 
-                let (tx, rx) = oneshot::channel();
-                let _ = sql_tx.send(SqlRequest { response_sender: tx }).await;
-                let buf_res = rx.await.expect("received buffer");
+                let (page_sender, page_receiver) = oneshot::channel();
+                let _ = sql_request_sender
+                    .send(SqlRequest {
+                        page_sender: page_sender,
+                    })
+                    .await;
+                let page_response = page_receiver.await.expect("received buffer");
 
-                let bytes = Bytes::from(buf_res);
+                let ct = &page_response.content_type;
+                let lm = page_response.format_last_modified_timestamp();
+                let bytes = Bytes::from(page_response.body);
 
                 let body_stream = stream! {
                     yield Result::<Bytes, std::io::Error>::Ok(bytes);
@@ -102,20 +108,23 @@ impl Repository {
 
                 let body = Body::wrap_stream(body_stream);
                 Response::builder()
-                    .header(header::CONTENT_TYPE, &page.content_type)
-                    .header(header::LAST_MODIFIED, page.format_last_modified_timestamp())
+                    .header(header::CONTENT_TYPE, ct)
+                    .header(header::LAST_MODIFIED, lm)
                     .body(body)
             }
         }
     }
 }
 
-struct PageHeaders {
+struct PageContent {
     last_modified_uxt: i64,
     content_type: String,
+    content_length: usize,
+    row_id: i64,
+    body: Vec<u8>,
 }
 
-impl PageHeaders {
+impl PageContent {
     fn format_last_modified_timestamp(&self) -> String {
         let last_modified_timestamp = NaiveDateTime::from_timestamp_opt(self.last_modified_uxt, 0)
             .expect("timestamp i64 within range");
