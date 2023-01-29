@@ -8,8 +8,8 @@ use rusqlite::blob::Blob;
 use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex};
+use std::sync::{Arc};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 #[derive(Clone)]
 struct Repository {
@@ -17,6 +17,10 @@ struct Repository {
     // Tokio::Mutex might be more concurrent alternative, if needed
     // ... or create multiple connections in a pool?
     conn_shared: Arc<Mutex<Connection>>,
+}
+
+struct SqlRequest {
+    response_sender: oneshot::Sender<Vec<u8>>,
 }
 
 impl Repository {
@@ -67,30 +71,30 @@ impl Repository {
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::empty()),
             Ok(Some(page)) => {
-                let (read_length, rx) = {
+                let (sql_tx, mut sql_rx) = mpsc::channel::<SqlRequest>(1);
+
+                {
                     let body_blob: Blob = conn_locked
                         .blob_open(DatabaseName::Main, "pages", "body", row_id, true)
                         .expect("open body blob");
 
-                    let (tx, rx) = oneshot::channel::<Vec<u8>>();
                     let mut buf: Vec<u8> = Vec::with_capacity(content_length);
                     buf.resize(content_length, 0);
                     let read_length = body_blob.read_at(&mut buf, 0).expect("read body blob");
+                    buf.resize(read_length, 0);
 
-                    // introduce a channel to read the vec from
                     let _t_sender = tokio::spawn(async move {
-                        let _ = tx.send(buf);
+                        if let Some(request) = sql_rx.recv().await {
+                            let _ = request.response_sender.send(buf);
+                        }
                     });
-                    (read_length, rx)
                 };
 
+                let (tx, rx) = oneshot::channel();
+                let _ = sql_tx.send(SqlRequest { response_sender: tx }).await;
                 let buf_res = rx.await.expect("received buffer");
 
-                let bytes = if read_length == buf_res.len() {
-                    Bytes::from(buf_res)
-                } else {
-                    Bytes::copy_from_slice(&buf_res[0..read_length])
-                };
+                let bytes = Bytes::from(buf_res);
 
                 let body_stream = stream! {
                     yield Result::<Bytes, std::io::Error>::Ok(bytes);
