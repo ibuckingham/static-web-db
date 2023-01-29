@@ -1,13 +1,15 @@
+use async_stream::stream;
 use chrono::{DateTime, NaiveDateTime, Utc};
+use hyper::body::Bytes;
 use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{header, Body, Method, Request, Response, Server, StatusCode};
-use rusqlite::{Connection, DatabaseName, OptionalExtension};
 use rusqlite::blob::Blob;
+use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use hyper::body::Bytes;
+use std::sync::Arc;
+use tokio::sync::{oneshot, Mutex};
 
 #[derive(Clone)]
 struct Repository {
@@ -19,34 +21,43 @@ struct Repository {
 
 impl Repository {
     fn new() -> Repository {
-        let conn = Connection::open("site.db").expect("connect to db");
+        let conn = Connection::open_with_flags(
+            "site.db",
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("connect to db");
 
         Repository {
             conn_shared: Arc::new(Mutex::new(conn)),
         }
     }
 
-    fn get_response_for_path(&self, path: &str) -> hyper::http::Result<Response<Body>> {
+    async fn get_response_for_path(&self, path: &str) -> hyper::http::Result<Response<Body>> {
         let conn = &self.conn_shared;
-        let conn_locked = conn.lock().unwrap();
+        let conn_locked = conn.lock().await;
 
-        let mut stmt = conn_locked
-            .prepare("select last_modified_uxt, content_type, rowid, length(body) as content_length from pages where path = ?")
-            .expect("SQL statement preparable");
+        let (page_data, row_id, content_length) = {
+            let mut stmt = conn_locked
+                .prepare("select last_modified_uxt, content_type, rowid, length(body) as content_length from pages where path = ?")
+                .expect("SQL statement preparable");
 
-        let mut row_id: i64 = 0;
-        let mut content_length = 0;
+            let mut row_id: i64 = 0;
+            let mut content_length = 0;
 
-        let page_data = stmt.query_row([path], |row| {
-            let lm = row.get(0)?;
-            let ct = row.get(1)?;
-            row_id = row.get(2)?;
-            content_length = row.get(3)?;
-            Ok(PageHeaders {
-                last_modified_uxt: lm,
-                content_type: ct,
-            })
-        }).optional();
+            let pd = stmt
+                .query_row([path], |row| {
+                    let lm = row.get(0)?;
+                    let ct = row.get(1)?;
+                    row_id = row.get(2)?;
+                    content_length = row.get(3)?;
+                    Ok(PageHeaders {
+                        last_modified_uxt: lm,
+                        content_type: ct,
+                    })
+                })
+                .optional();
+            (pd, row_id, content_length)
+        };
 
         match page_data {
             Err(e) => Response::builder()
@@ -56,33 +67,41 @@ impl Repository {
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::empty()),
             Ok(Some(page)) => {
+                let (read_length, rx) = {
+                    let body_blob: Blob = conn_locked
+                        .blob_open(DatabaseName::Main, "pages", "body", row_id, true)
+                        .expect("open body blob");
 
-                let body_blob: Blob = conn_locked.blob_open(
-                    DatabaseName::Main,
-                    "pages",
-                    "body",
-                    row_id,
-                    true
-                ).expect("open body blob");
+                    let (tx, rx) = oneshot::channel::<Vec<u8>>();
+                    let mut buf: Vec<u8> = Vec::with_capacity(content_length);
+                    buf.resize(content_length, 0);
+                    let read_length = body_blob.read_at(&mut buf, 0).expect("read body blob");
 
-                let mut buf: Vec<u8> = Vec::with_capacity(content_length);
-                buf.resize(content_length, 0);
-                let read_length = body_blob.read_at(&mut buf, 0).expect("read body blob");
-                let bytes = if read_length == buf.len() {
-                    Bytes::from(buf)
-                } else {
-                    Bytes::copy_from_slice(&buf[0..read_length])
+                    // introduce a channel to read the vec from
+                    let _t_sender = tokio::spawn(async move {
+                        let _ = tx.send(buf);
+                    });
+                    (read_length, rx)
                 };
 
-                let chunks: Vec<Result<_, std::io::Error>> = vec!(Ok(bytes));
+                let buf_res = rx.await.expect("received buffer");
 
-                let response = Response::builder()
+                let bytes = if read_length == buf_res.len() {
+                    Bytes::from(buf_res)
+                } else {
+                    Bytes::copy_from_slice(&buf_res[0..read_length])
+                };
+
+                let body_stream = stream! {
+                    yield Result::<Bytes, std::io::Error>::Ok(bytes);
+                };
+
+                let body = Body::wrap_stream(body_stream);
+                Response::builder()
                     .header(header::CONTENT_TYPE, &page.content_type)
                     .header(header::LAST_MODIFIED, page.format_last_modified_timestamp())
-                    .body(Body::wrap_stream(futures_util::stream::iter(chunks)));
-
-                return response;
-            },
+                    .body(body)
+            }
         }
     }
 }
@@ -111,7 +130,7 @@ async fn get_response(
 ) -> hyper::http::Result<Response<Body>> {
     // only allow GET methods
     match (req.method(), req.uri().path()) {
-        (&Method::GET, path) => repository.get_response_for_path(path),
+        (&Method::GET, path) => repository.get_response_for_path(path).await,
         _ => Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .body(Body::empty()),
