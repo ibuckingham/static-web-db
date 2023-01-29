@@ -8,84 +8,33 @@ use rusqlite::blob::Blob;
 use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::mpsc::Sender;
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Clone)]
 struct Repository {
-    // Std::Mutex means grabbing a lock on every request
-    // Tokio::Mutex might be more concurrent alternative, if needed
-    // ... or create multiple connections in a pool?
-    conn_shared: Arc<Mutex<Connection>>,
+    sql_request_sender: Sender<SqlRequest>,
 }
 
 struct SqlRequest {
+    path: String,
     page_sender: oneshot::Sender<rusqlite::Result<Option<PageContent>>>,
 }
 
 impl Repository {
-    fn new() -> Repository {
-        let conn = Connection::open_with_flags(
-            "site.db",
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .expect("connect to db");
-
+    fn new(sql_request_sender: Sender<SqlRequest>) -> Repository {
         Repository {
-            conn_shared: Arc::new(Mutex::new(conn)),
+            sql_request_sender: sql_request_sender,
         }
     }
 
     async fn get_response_for_path(&self, path: &str) -> hyper::http::Result<Response<Body>> {
-        let conn = &self.conn_shared;
-        let conn_locked = conn.lock().await;
-
-        let (sql_request_sender, mut sql_request_receiver) = mpsc::channel::<SqlRequest>(1);
-
-        let page_data = {
-            let mut stmt = conn_locked
-                .prepare("select last_modified_uxt, content_type, rowid, length(body) as content_length from pages where path = ?")
-                .expect("SQL statement preparable");
-
-            let result = stmt
-                .query_row([path], |row| {
-                    let lm = row.get(0)?;
-                    let ct = row.get(1)?;
-                    let row_id = row.get(2)?;
-                    let content_length = row.get(3)?;
-
-                    Ok(PageInfo {
-                        last_modified_uxt: lm,
-                        content_type: ct,
-                        content_length: content_length,
-                        row_id: row_id,
-                    })
-                })
-                .optional();
-
-            let mut buf = Vec::<u8>::new();
-            if let Ok(Some(page)) = &result {
-                let body_blob: Blob = conn_locked
-                    .blob_open(DatabaseName::Main, "pages", "body", page.row_id, true)
-                    .expect("open body blob");
-
-                buf.resize(page.content_length, 0);
-                let read_length = body_blob.read_at(&mut buf, 0).expect("read body blob");
-                buf.resize(read_length, 0);
-            }
-
-            result.map(|o| o.map(|p| PageContent { info: p, body: buf }))
-        };
-
-        let _t_sender = tokio::spawn(async move {
-            if let Some(request) = sql_request_receiver.recv().await {
-                let _ = request.page_sender.send(page_data);
-            }
-        });
-
         let (page_sender, page_receiver) = oneshot::channel();
-        let _ = sql_request_sender
+        let _ = &self
+            .sql_request_sender
+            .clone()
             .send(SqlRequest {
+                path: path.to_string(),
                 page_sender: page_sender,
             })
             .await;
@@ -158,7 +107,21 @@ async fn get_response(
 
 #[tokio::main]
 async fn main() {
-    let repository = Repository::new();
+    let (sql_request_sender, mut sql_request_receiver) = mpsc::channel::<SqlRequest>(1);
+    let repository = Repository::new(sql_request_sender);
+
+    let _t_sender = tokio::spawn(async move {
+        let conn = Connection::open_with_flags(
+            "site.db",
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("connect to db");
+
+        while let Some(request) = sql_request_receiver.recv().await {
+            let page = get_page_from_database(&request.path, &conn);
+            let _ = request.page_sender.send(page);
+        }
+    });
 
     // A `Service` is needed for every connection, so this
     // creates one
@@ -178,4 +141,39 @@ async fn main() {
     if let Err(e) = server.await {
         eprintln!("server error: {}", e);
     }
+}
+
+fn get_page_from_database(path: &str, conn: &Connection) -> rusqlite::Result<Option<PageContent>> {
+    let mut stmt = conn
+        .prepare("select last_modified_uxt, content_type, rowid, length(body) as content_length from pages where path = ?")
+        .expect("SQL statement preparable");
+
+    let result = stmt
+        .query_row([path], |row| {
+            let lm = row.get(0)?;
+            let ct = row.get(1)?;
+            let row_id = row.get(2)?;
+            let content_length = row.get(3)?;
+
+            Ok(PageInfo {
+                last_modified_uxt: lm,
+                content_type: ct,
+                content_length: content_length,
+                row_id: row_id,
+            })
+        })
+        .optional();
+
+    let mut buf = Vec::<u8>::new();
+    if let Ok(Some(page)) = &result {
+        let body_blob: Blob = conn
+            .blob_open(DatabaseName::Main, "pages", "body", page.row_id, true)
+            .expect("open body blob");
+
+        buf.resize(page.content_length, 0);
+        let read_length = body_blob.read_at(&mut buf, 0).expect("read body blob");
+        buf.resize(read_length, 0);
+    }
+
+    result.map(|o| o.map(|p| PageContent { info: p, body: buf }))
 }
