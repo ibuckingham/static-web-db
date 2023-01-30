@@ -7,6 +7,7 @@ use rusqlite::blob::Blob;
 use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension};
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::ops::Range;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Clone)]
@@ -22,12 +23,15 @@ struct SqlRequest {
 
 struct BodyRequest {
     row_id: i64,
-    content_length: usize,
+    byte_range: Range<usize>,
     body_sender: oneshot::Sender<rusqlite::Result<Vec<u8>>>,
 }
 
 impl Repository {
-    fn new(sql_request_sender: mpsc::Sender<SqlRequest>, body_request_sender: mpsc::Sender<BodyRequest>) -> Repository {
+    fn new(
+        sql_request_sender: mpsc::Sender<SqlRequest>,
+        body_request_sender: mpsc::Sender<BodyRequest>,
+    ) -> Repository {
         Repository {
             sql_request_sender,
             body_request_sender,
@@ -56,27 +60,31 @@ impl Repository {
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::empty()),
             Ok(Some(info)) => {
-                let (body_sender, body_receiver) = oneshot::channel();
-
-                let _ = &self
-                    .body_request_sender
-                    .clone()
-                    .send(BodyRequest {
-                        row_id: info.row_id,
-                        content_length: info.content_length,
-                        body_sender,
-                    })
-                    .await;
-
                 let ct = &info.content_type;
                 let lm = info.format_last_modified_timestamp();
+                let row_id = info.row_id;
+                let content_length = info.content_length;
+                let body_request_sender = self.body_request_sender.clone();
 
-                let body_vec = body_receiver.await.expect("body received").expect("no db errors");
-                let bytes = Bytes::from(body_vec);
-
-                // how to convert from channel to stream?
                 let body_stream = async_stream::stream! {
-                    yield Result::<Bytes, std::io::Error>::Ok(bytes);
+                    let block_size = 16_usize * 1024;
+                    let mut next_start = 0_usize;
+
+                    while next_start < content_length {
+                        let (body_sender, body_receiver) = oneshot::channel();
+                        let byte_range = (next_start..(next_start + block_size));
+                        let _ = body_request_sender.send(BodyRequest {
+                                row_id,
+                                byte_range,
+                                body_sender,
+                            })
+                            .await;
+
+                        let body_vec = body_receiver.await.expect("body received").expect("no db errors");
+                        let bytes = Bytes::from(body_vec);
+                        yield Result::<Bytes, std::io::Error>::Ok(bytes);
+                        next_start += block_size;
+                    };
                 };
 
                 let body = Body::wrap_stream(body_stream);
@@ -133,11 +141,11 @@ async fn main() {
             "site.db",
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-            .expect("connect to db");
+        .expect("connect to db");
 
         while let Some(request) = sql_request_receiver.recv().await {
-            let page_recvd = get_page_info_from_database(&request.path, &conn);
-            let _ = request.page_sender.send(page_recvd);
+            let page = get_page_info_from_database(&request.path, &conn);
+            let _ = request.page_sender.send(page);
         }
     });
 
@@ -146,10 +154,10 @@ async fn main() {
             "site.db",
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-            .expect("connect to db");
+        .expect("connect to db");
 
         while let Some(request) = body_request_receiver.recv().await {
-            let body = get_body_buf_from_db(request.row_id, request.content_length, &conn);
+            let body = get_body_buf_from_db(request.row_id, request.byte_range, &conn);
             let _ = request.body_sender.send(body);
         }
     });
@@ -174,10 +182,13 @@ async fn main() {
     }
 }
 
-fn get_page_info_from_database(path: &str, conn: &Connection) -> rusqlite::Result<Option<PageInfo>> {
+fn get_page_info_from_database(
+    path: &str,
+    conn: &Connection,
+) -> rusqlite::Result<Option<PageInfo>> {
     let mut stmt = conn
         .prepare("select last_modified_uxt, content_type, rowid, length(body) as content_length from pages where path = ?")
-        .expect("SQL statement preparable");
+        .expect("SQL statement prepared");
 
     stmt.query_row([path], |row| {
         let lm = row.get(0)?;
@@ -192,16 +203,21 @@ fn get_page_info_from_database(path: &str, conn: &Connection) -> rusqlite::Resul
             row_id,
         })
     })
-        .optional()
+    .optional()
 }
 
-fn get_body_buf_from_db(row_id: i64, content_length: usize, conn: &Connection) -> rusqlite::Result<Vec<u8>> {
-    let mut buf = Vec::<u8>::with_capacity(content_length);
-    let body_blob: Blob = conn
-        .blob_open(DatabaseName::Main, "pages", "body", row_id, true)?;
+fn get_body_buf_from_db(
+    row_id: i64,
+    byte_range: Range<usize>,
+    conn: &Connection,
+) -> rusqlite::Result<Vec<u8>> {
+    let body_blob: Blob = conn.blob_open(DatabaseName::Main, "pages", "body", row_id, true)?;
 
-    buf.resize(content_length, 0);
-    let read_length = body_blob.read_at(&mut buf, 0)?;
+    let mut buf = Vec::<u8>::with_capacity(byte_range.len());
+    buf.resize(byte_range.len(), 0);
+
+    let read_length = body_blob.read_at(&mut buf, byte_range.start)?;
+
     buf.resize(read_length, 0);
     Ok(buf)
 }
