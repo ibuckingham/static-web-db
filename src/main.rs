@@ -12,24 +12,30 @@ use tokio::sync::{mpsc, oneshot};
 #[derive(Clone)]
 struct Repository {
     sql_request_sender: mpsc::Sender<SqlRequest>,
+    body_request_sender: mpsc::Sender<BodyRequest>,
 }
 
 struct SqlRequest {
     path: String,
     page_sender: oneshot::Sender<rusqlite::Result<Option<PageInfo>>>,
-    body_sender: mpsc::Sender<Vec<u8>>,
+}
+
+struct BodyRequest {
+    row_id: i64,
+    content_length: usize,
+    body_sender: oneshot::Sender<rusqlite::Result<Vec<u8>>>,
 }
 
 impl Repository {
-    fn new(sql_request_sender: mpsc::Sender<SqlRequest>) -> Repository {
+    fn new(sql_request_sender: mpsc::Sender<SqlRequest>, body_request_sender: mpsc::Sender<BodyRequest>) -> Repository {
         Repository {
             sql_request_sender,
+            body_request_sender,
         }
     }
 
     async fn get_response_for_path(&self, path: &str) -> hyper::http::Result<Response<Body>> {
         let (page_sender, page_receiver) = oneshot::channel();
-        let (body_sender, mut body_receiver) = mpsc::channel::<Vec<u8>>(32);
 
         let _ = &self
             .sql_request_sender
@@ -37,7 +43,6 @@ impl Repository {
             .send(SqlRequest {
                 path: path.to_string(),
                 page_sender,
-                body_sender,
             })
             .await;
 
@@ -51,10 +56,22 @@ impl Repository {
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::empty()),
             Ok(Some(info)) => {
+                let (body_sender, body_receiver) = oneshot::channel();
+
+                let _ = &self
+                    .body_request_sender
+                    .clone()
+                    .send(BodyRequest {
+                        row_id: info.row_id,
+                        content_length: info.content_length,
+                        body_sender,
+                    })
+                    .await;
+
                 let ct = &info.content_type;
                 let lm = info.format_last_modified_timestamp();
 
-                let body_vec = body_receiver.recv().await.expect("body received");
+                let body_vec = body_receiver.await.expect("body received").expect("no db errors");
                 let bytes = Bytes::from(body_vec);
 
                 // how to convert from channel to stream?
@@ -108,9 +125,10 @@ async fn get_response(
 #[tokio::main]
 async fn main() {
     let (sql_request_sender, mut sql_request_receiver) = mpsc::channel::<SqlRequest>(1);
-    let repository = Repository::new(sql_request_sender);
+    let (body_request_sender, mut body_request_receiver) = mpsc::channel::<BodyRequest>(1);
+    let repository = Repository::new(sql_request_sender, body_request_sender);
 
-    let _t_sender = tokio::spawn(async move {
+    let _page_info_sender = tokio::spawn(async move {
         let conn = Connection::open_with_flags(
             "site.db",
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -119,21 +137,20 @@ async fn main() {
 
         while let Some(request) = sql_request_receiver.recv().await {
             let page_recvd = get_page_info_from_database(&request.path, &conn);
+            let _ = request.page_sender.send(page_recvd);
+        }
+    });
 
-            let body_info = page_recvd.as_ref().map_or(None, |o| o.as_ref().map(|p| (p.row_id, p.content_length)));
+    let _body_sender = tokio::spawn(async move {
+        let conn = Connection::open_with_flags(
+            "site.db",
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+            .expect("connect to db");
 
-            match page_recvd {
-                n @ Ok(Some(_)) => {
-                    let _ = request.page_sender.send(n);
-                    let body_maybe = body_info.map(|b| get_body_buf_from_db(b.0, b.1, &conn).expect("read body from db"));
-                    if let Some(body) = body_maybe {
-                        let _ = request.body_sender.send(body).await;
-                    }
-                }
-                n @ (Ok(None) | Err(_)) => {
-                    let _ = request.page_sender.send(n);
-                }
-            }
+        while let Some(request) = body_request_receiver.recv().await {
+            let body = get_body_buf_from_db(request.row_id, request.content_length, &conn);
+            let _ = request.body_sender.send(body);
         }
     });
 
