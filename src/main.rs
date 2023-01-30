@@ -1,4 +1,3 @@
-use async_stream::stream;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use hyper::body::Bytes;
 use hyper::server::conn::AddrStream;
@@ -8,34 +7,37 @@ use rusqlite::blob::Blob;
 use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Clone)]
 struct Repository {
-    sql_request_sender: Sender<SqlRequest>,
+    sql_request_sender: mpsc::Sender<SqlRequest>,
 }
 
 struct SqlRequest {
     path: String,
-    page_sender: oneshot::Sender<rusqlite::Result<Option<PageContent>>>,
+    page_sender: oneshot::Sender<rusqlite::Result<Option<PageInfo>>>,
+    body_sender: mpsc::Sender<Vec<u8>>,
 }
 
 impl Repository {
-    fn new(sql_request_sender: Sender<SqlRequest>) -> Repository {
+    fn new(sql_request_sender: mpsc::Sender<SqlRequest>) -> Repository {
         Repository {
-            sql_request_sender: sql_request_sender,
+            sql_request_sender,
         }
     }
 
     async fn get_response_for_path(&self, path: &str) -> hyper::http::Result<Response<Body>> {
         let (page_sender, page_receiver) = oneshot::channel();
+        let (body_sender, mut body_receiver) = mpsc::channel::<Vec<u8>>(32);
+
         let _ = &self
             .sql_request_sender
             .clone()
             .send(SqlRequest {
                 path: path.to_string(),
-                page_sender: page_sender,
+                page_sender,
+                body_sender,
             })
             .await;
 
@@ -48,12 +50,15 @@ impl Repository {
             Ok(None) => Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::empty()),
-            Ok(Some(page)) => {
-                let ct = &page.info.content_type;
-                let lm = page.info.format_last_modified_timestamp();
-                let bytes = Bytes::from(page.body);
+            Ok(Some(info)) => {
+                let ct = &info.content_type;
+                let lm = info.format_last_modified_timestamp();
 
-                let body_stream = stream! {
+                let body_vec = body_receiver.recv().await.expect("body received");
+                let bytes = Bytes::from(body_vec);
+
+                // how to convert from channel to stream?
+                let body_stream = async_stream::stream! {
                     yield Result::<Bytes, std::io::Error>::Ok(bytes);
                 };
 
@@ -65,11 +70,6 @@ impl Repository {
             }
         }
     }
-}
-
-struct PageContent {
-    info: PageInfo,
-    body: Vec<u8>,
 }
 
 struct PageInfo {
@@ -115,11 +115,25 @@ async fn main() {
             "site.db",
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .expect("connect to db");
+            .expect("connect to db");
 
         while let Some(request) = sql_request_receiver.recv().await {
-            let page = get_page_from_database(&request.path, &conn);
-            let _ = request.page_sender.send(page);
+            let page_recvd = get_page_info_from_database(&request.path, &conn);
+
+            let body_info = page_recvd.as_ref().map_or(None, |o| o.as_ref().map(|p| (p.row_id, p.content_length)));
+
+            match page_recvd {
+                n @ Ok(Some(_)) => {
+                    let _ = request.page_sender.send(n);
+                    let body_maybe = body_info.map(|b| get_body_buf_from_db(b.0, b.1, &conn).expect("read body from db"));
+                    if let Some(body) = body_maybe {
+                        let _ = request.body_sender.send(body).await;
+                    }
+                }
+                n @ (Ok(None) | Err(_)) => {
+                    let _ = request.page_sender.send(n);
+                }
+            }
         }
     });
 
@@ -143,37 +157,34 @@ async fn main() {
     }
 }
 
-fn get_page_from_database(path: &str, conn: &Connection) -> rusqlite::Result<Option<PageContent>> {
+fn get_page_info_from_database(path: &str, conn: &Connection) -> rusqlite::Result<Option<PageInfo>> {
     let mut stmt = conn
         .prepare("select last_modified_uxt, content_type, rowid, length(body) as content_length from pages where path = ?")
         .expect("SQL statement preparable");
 
-    let result = stmt
-        .query_row([path], |row| {
-            let lm = row.get(0)?;
-            let ct = row.get(1)?;
-            let row_id = row.get(2)?;
-            let content_length = row.get(3)?;
+    stmt.query_row([path], |row| {
+        let lm = row.get(0)?;
+        let ct = row.get(1)?;
+        let row_id = row.get(2)?;
+        let content_length = row.get(3)?;
 
-            Ok(PageInfo {
-                last_modified_uxt: lm,
-                content_type: ct,
-                content_length: content_length,
-                row_id: row_id,
-            })
+        Ok(PageInfo {
+            last_modified_uxt: lm,
+            content_type: ct,
+            content_length,
+            row_id,
         })
-        .optional();
+    })
+        .optional()
+}
 
-    let mut buf = Vec::<u8>::new();
-    if let Ok(Some(page)) = &result {
-        let body_blob: Blob = conn
-            .blob_open(DatabaseName::Main, "pages", "body", page.row_id, true)
-            .expect("open body blob");
+fn get_body_buf_from_db(row_id: i64, content_length: usize, conn: &Connection) -> rusqlite::Result<Vec<u8>> {
+    let mut buf = Vec::<u8>::with_capacity(content_length);
+    let body_blob: Blob = conn
+        .blob_open(DatabaseName::Main, "pages", "body", row_id, true)?;
 
-        buf.resize(page.content_length, 0);
-        let read_length = body_blob.read_at(&mut buf, 0).expect("read body blob");
-        buf.resize(read_length, 0);
-    }
-
-    result.map(|o| o.map(|p| PageContent { info: p, body: buf }))
+    buf.resize(content_length, 0);
+    let read_length = body_blob.read_at(&mut buf, 0)?;
+    buf.resize(read_length, 0);
+    Ok(buf)
 }
