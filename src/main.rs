@@ -65,29 +65,44 @@ impl Repository {
                 let row_id = info.row_id;
                 let content_length = info.content_length;
                 let body_request_sender = self.body_request_sender.clone();
+                let block_size = 16_usize * 1024;
 
-                let body_stream = async_stream::stream! {
-                    let block_size = 16_usize * 1024;
-                    let mut next_start = 0_usize;
+                let body = if content_length <= block_size {
+                    // get entire response
+                    let (body_sender, body_receiver) = oneshot::channel();
+                    let _ = body_request_sender.send(BodyRequest {
+                        row_id,
+                        byte_range: (0..block_size),
+                        body_sender,
+                    }).await;
 
-                    while next_start < content_length {
-                        let (body_sender, body_receiver) = oneshot::channel();
-                        let byte_range = (next_start..(next_start + block_size));
-                        let _ = body_request_sender.send(BodyRequest {
-                                row_id,
-                                byte_range,
-                                body_sender,
-                            })
-                            .await;
+                    let body_vec = body_receiver.await.expect("body received").expect("no db errors");
+                    Body::from(body_vec)
+                } else {
+                    // return chunked response
+                    let body_stream = async_stream::stream! {
+                        let mut next_start = 0_usize;
 
-                        let body_vec = body_receiver.await.expect("body received").expect("no db errors");
-                        let bytes = Bytes::from(body_vec);
-                        yield Result::<Bytes, std::io::Error>::Ok(bytes);
-                        next_start += block_size;
+                        while next_start < content_length {
+                            let (body_sender, body_receiver) = oneshot::channel();
+                            let byte_range = (next_start..(next_start + block_size));
+                            let _ = body_request_sender.send(BodyRequest {
+                                    row_id,
+                                    byte_range,
+                                    body_sender,
+                                })
+                                .await;
+
+                            let body_vec = body_receiver.await.expect("body received").expect("no db errors");
+                            let bytes = Bytes::from(body_vec);
+                            yield Result::<Bytes, std::io::Error>::Ok(bytes);
+                            next_start += block_size;
+                        };
                     };
+
+                    Body::wrap_stream(body_stream)
                 };
 
-                let body = Body::wrap_stream(body_stream);
                 Response::builder()
                     .header(header::CONTENT_TYPE, ct)
                     .header(header::LAST_MODIFIED, lm)
