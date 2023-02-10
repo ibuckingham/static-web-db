@@ -9,13 +9,57 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::ops::Range;
 use tokio::sync::{mpsc, oneshot};
-use tokio::sync::mpsc::Receiver;
 use tokio::task::spawn_blocking;
 
 #[derive(Clone)]
 struct Repository {
-    sql_request_sender: mpsc::Sender<SqlRequest>,
-    body_request_sender: mpsc::Sender<BodyRequest>,
+    sql_request_sender: BlockingSender<SqlRequest>,
+    body_request_sender: BlockingSender<BodyRequest>,
+}
+
+fn blocking_channel<T>(buffer: usize) -> (BlockingSender<T>, BlockingReceiver<T>) {
+    let (sender, receiver) = mpsc::channel::<T>(buffer);
+
+    // todo
+    // added use of CondVar in parallel
+    // - at first, always signalled
+    // then add the dequeue?
+    // then remove mpsc completely
+    (
+        BlockingSender { inner: sender },
+        BlockingReceiver { inner: receiver },
+    )
+}
+
+struct BlockingSender<T> {
+    inner: mpsc::Sender<T>,
+}
+
+impl<T> BlockingSender<T> {
+    async fn send(&self, value: T) -> Result<(), mpsc::error::SendError<T>> {
+        self.inner.send(value).await
+    }
+}
+
+impl<T> Clone for BlockingSender<T> {
+    fn clone(&self) -> Self {
+        BlockingSender {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+struct BlockingReceiver<T> {
+    inner: mpsc::Receiver<T>,
+}
+
+impl<T> BlockingReceiver<T> {
+    fn blocking_recv(&mut self) -> Option<T> {
+        // block on CondVar
+
+
+        self.inner.blocking_recv()
+    }
 }
 
 struct SqlRequest {
@@ -31,8 +75,8 @@ struct BodyRequest {
 
 impl Repository {
     fn new(
-        sql_request_sender: mpsc::Sender<SqlRequest>,
-        body_request_sender: mpsc::Sender<BodyRequest>,
+        sql_request_sender: BlockingSender<SqlRequest>,
+        body_request_sender: BlockingSender<BodyRequest>,
     ) -> Repository {
         Repository {
             sql_request_sender,
@@ -72,13 +116,18 @@ impl Repository {
                 let body = if content_length <= BLOCK_SIZE_BYTES {
                     // get entire response
                     let (body_sender, body_receiver) = oneshot::channel();
-                    let _ = body_request_sender.send(BodyRequest {
-                        row_id,
-                        byte_range: (0..BLOCK_SIZE_BYTES),
-                        body_sender,
-                    }).await;
+                    let _ = body_request_sender
+                        .send(BodyRequest {
+                            row_id,
+                            byte_range: (0..BLOCK_SIZE_BYTES),
+                            body_sender,
+                        })
+                        .await;
 
-                    let body_vec = body_receiver.await.expect("body received").expect("no db errors");
+                    let body_vec = body_receiver
+                        .await
+                        .expect("body received")
+                        .expect("no db errors");
                     Body::from(body_vec)
                 } else {
                     // return chunked response
@@ -149,18 +198,14 @@ async fn get_response(
 
 #[tokio::main]
 async fn main() {
-    let (sql_request_sender, sql_request_receiver) = mpsc::channel::<SqlRequest>(4);
-    let (body_request_sender, body_request_receiver) = mpsc::channel::<BodyRequest>(4);
+    let (sql_request_sender, sql_request_receiver) = blocking_channel::<SqlRequest>(4);
+    let (body_request_sender, body_request_receiver) = blocking_channel::<BodyRequest>(4);
     let repository = Repository::new(sql_request_sender, body_request_sender);
 
     // threads to make blocking calls to the database
-    let _ = spawn_blocking(move || {
-        db_read_page_task(sql_request_receiver)
-    });
+    let _ = spawn_blocking(move || db_read_page_task(sql_request_receiver));
 
-    let _ = spawn_blocking(move || {
-        db_read_body_task(body_request_receiver)
-    });
+    let _ = spawn_blocking(move || db_read_body_task(body_request_receiver));
 
     // A `Service` is needed for every connection, so this
     // creates one
@@ -182,12 +227,12 @@ async fn main() {
     }
 }
 
-fn db_read_page_task(mut sql_request_receiver: Receiver<SqlRequest>) {
+fn db_read_page_task(mut sql_request_receiver: BlockingReceiver<SqlRequest>) {
     let conn = Connection::open_with_flags(
         "site.db",
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-        .expect("connect to db");
+    .expect("connect to db");
 
     while let Some(request) = sql_request_receiver.blocking_recv() {
         let page = get_page_info_from_database(&request.path, &conn);
@@ -195,12 +240,12 @@ fn db_read_page_task(mut sql_request_receiver: Receiver<SqlRequest>) {
     }
 }
 
-fn db_read_body_task(mut body_request_receiver: Receiver<BodyRequest>) {
+fn db_read_body_task(mut body_request_receiver: BlockingReceiver<BodyRequest>) {
     let conn = Connection::open_with_flags(
         "site.db",
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-        .expect("connect to db");
+    .expect("connect to db");
 
     while let Some(request) = body_request_receiver.blocking_recv() {
         let body = get_body_buf_from_db(request.row_id, request.byte_range, &conn);
