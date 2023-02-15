@@ -8,6 +8,8 @@ use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::ops::Range;
+use std::time::Duration;
+use tokio::sync::mpsc::error::SendTimeoutError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::spawn_blocking;
 
@@ -19,15 +21,13 @@ struct Repository {
 
 fn blocking_channel<T>(buffer: usize) -> (BlockingSender<T>, BlockingReceiver<T>) {
     let (sender, receiver) = mpsc::channel::<T>(buffer);
-
-    // todo
-    // added use of CondVar in parallel
-    // - at first, always signalled
-    // then add the dequeue?
-    // then remove mpsc completely
     (
-        BlockingSender { inner: sender },
-        BlockingReceiver { inner: receiver },
+        BlockingSender {
+            inner: sender,
+        },
+        BlockingReceiver {
+            inner: receiver,
+        },
     )
 }
 
@@ -36,8 +36,8 @@ struct BlockingSender<T> {
 }
 
 impl<T> BlockingSender<T> {
-    async fn send(&self, value: T) -> Result<(), mpsc::error::SendError<T>> {
-        self.inner.send(value).await
+    async fn send_timeout(&self, value: T, timeout: Duration) -> Result<(), SendTimeoutError<T>> {
+        self.inner.send_timeout(value, timeout).await
     }
 }
 
@@ -55,9 +55,6 @@ struct BlockingReceiver<T> {
 
 impl<T> BlockingReceiver<T> {
     fn blocking_recv(&mut self) -> Option<T> {
-        // block on CondVar
-
-
         self.inner.blocking_recv()
     }
 }
@@ -90,10 +87,13 @@ impl Repository {
         let _ = &self
             .sql_request_sender
             .clone()
-            .send(SqlRequest {
-                path: path.to_string(),
-                page_sender,
-            })
+            .send_timeout(
+                SqlRequest {
+                    path: path.to_string(),
+                    page_sender,
+                },
+                Duration::from_secs(1),
+            )
             .await;
 
         let page_response = page_receiver.await.expect("received something");
@@ -117,11 +117,14 @@ impl Repository {
                     // get entire response
                     let (body_sender, body_receiver) = oneshot::channel();
                     let _ = body_request_sender
-                        .send(BodyRequest {
-                            row_id,
-                            byte_range: (0..BLOCK_SIZE_BYTES),
-                            body_sender,
-                        })
+                        .send_timeout(
+                            BodyRequest {
+                                row_id,
+                                byte_range: (0..BLOCK_SIZE_BYTES),
+                                body_sender,
+                            },
+                            Duration::from_secs(1),
+                        )
                         .await;
 
                     let body_vec = body_receiver
@@ -137,11 +140,12 @@ impl Repository {
                         while next_start < content_length {
                             let (body_sender, body_receiver) = oneshot::channel();
                             let byte_range = (next_start..(next_start + BLOCK_SIZE_BYTES));
-                            let _ = body_request_sender.send(BodyRequest {
+                            let _ = body_request_sender.send_timeout(BodyRequest {
                                     row_id,
                                     byte_range,
                                     body_sender,
-                                })
+                                },
+                                Duration::from_secs(1))
                                 .await;
 
                             let body_vec = body_receiver.await.expect("body received").expect("no db errors");
