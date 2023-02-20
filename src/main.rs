@@ -9,9 +9,10 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::ops::Range;
 use std::time::Duration;
-use tokio::sync::mpsc::error::SendTimeoutError;
+use tokio::sync::mpsc::error::{SendError};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::spawn_blocking;
+use tokio::time::timeout;
 
 #[derive(Clone)]
 struct Repository {
@@ -36,8 +37,8 @@ struct BlockingSender<T> {
 }
 
 impl<T> BlockingSender<T> {
-    async fn send_timeout(&self, value: T, timeout: Duration) -> Result<(), SendTimeoutError<T>> {
-        self.inner.send_timeout(value, timeout).await
+    async fn send(&self, value: T) -> Result<(), SendError<T>> {
+        self.inner.send(value).await
     }
 }
 
@@ -87,25 +88,33 @@ impl Repository {
         let _ = &self
             .sql_request_sender
             .clone()
-            .send_timeout(
+            .send(
                 SqlRequest {
                     path: path.to_string(),
                     page_sender,
-                },
-                Duration::from_secs(1),
+                }
             )
             .await;
 
-        let page_response = page_receiver.await.expect("received something");
+        // TODO:
+        // timeout here and at the other send points,
+        // or somehow wrap the timeout around the caller of this function?
+        let page_response = timeout(Duration::from_secs(1), page_receiver).await;
 
         match page_response {
-            Err(e) => Response::builder()
+            Err(_elapsed) => Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(Body::empty()),
+            Ok(Err(e)) => Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Body::from(e.to_string())),
-            Ok(None) => Response::builder()
+            Ok(Ok(Err(e))) => Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(e.to_string())),
+            Ok(Ok(Ok(None))) => Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::empty()),
-            Ok(Some(info)) => {
+            Ok(Ok(Ok(Some(info)))) => {
                 let ct = &info.content_type;
                 let lm = info.format_last_modified_timestamp();
                 let row_id = info.row_id;
@@ -117,13 +126,12 @@ impl Repository {
                     // get entire response
                     let (body_sender, body_receiver) = oneshot::channel();
                     let _ = body_request_sender
-                        .send_timeout(
+                        .send(
                             BodyRequest {
                                 row_id,
                                 byte_range: (0..BLOCK_SIZE_BYTES),
                                 body_sender,
-                            },
-                            Duration::from_secs(1),
+                            }
                         )
                         .await;
 
@@ -140,12 +148,11 @@ impl Repository {
                         while next_start < content_length {
                             let (body_sender, body_receiver) = oneshot::channel();
                             let byte_range = (next_start..(next_start + BLOCK_SIZE_BYTES));
-                            let _ = body_request_sender.send_timeout(BodyRequest {
+                            let _ = body_request_sender.send(BodyRequest {
                                     row_id,
                                     byte_range,
                                     body_sender,
-                                },
-                                Duration::from_secs(1))
+                                })
                                 .await;
 
                             let body_vec = body_receiver.await.expect("body received").expect("no db errors");
