@@ -1,14 +1,14 @@
-use chrono::{DateTime, NaiveDateTime, Utc};
+use httpdate::HttpDate;
 use hyper::body::Bytes;
-use hyper::server::conn::AddrStream;
+use hyper::server::conn::{AddrStream};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{header, Body, Method, Request, Response, Server, StatusCode};
 use rusqlite::blob::Blob;
 use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::ops::Range;
-use std::time::Duration;
+use std::ops::{Add, Range};
+use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc::error::{SendError};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::spawn_blocking;
@@ -147,7 +147,7 @@ impl Repository {
 
                         while next_start < content_length {
                             let (body_sender, body_receiver) = oneshot::channel();
-                            let byte_range = (next_start..(next_start + BLOCK_SIZE_BYTES));
+                            let byte_range = next_start..(next_start + BLOCK_SIZE_BYTES);
                             let _ = body_request_sender.send(BodyRequest {
                                     row_id,
                                     byte_range,
@@ -175,7 +175,7 @@ impl Repository {
 }
 
 struct PageInfo {
-    last_modified_uxt: i64,
+    last_modified_uxt: u64,
     content_type: String,
     content_length: usize,
     row_id: i64,
@@ -183,14 +183,9 @@ struct PageInfo {
 
 impl PageInfo {
     fn format_last_modified_timestamp(&self) -> String {
-        let last_modified_timestamp = NaiveDateTime::from_timestamp_opt(self.last_modified_uxt, 0)
-            .expect("timestamp i64 within range");
-        let last_modified_date_time: DateTime<Utc> =
-            DateTime::from_utc(last_modified_timestamp, Utc);
-
-        last_modified_date_time
-            .format("%a, %d %b %Y %H:%M:%S GMT")
-            .to_string()
+        let last_modified_systime = SystemTime::UNIX_EPOCH.add(Duration::from_secs(self.last_modified_uxt));
+        let http_date = HttpDate::from(last_modified_systime);
+        http_date.to_string()
     }
 }
 
@@ -279,7 +274,7 @@ fn get_page_info_from_database(
         let content_length = row.get(3)?;
 
         Ok(PageInfo {
-            last_modified_uxt: lm,
+            last_modified_uxt: lm ,
             content_type: ct,
             content_length,
             row_id,
