@@ -9,63 +9,22 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::ops::{Add, Range};
 use std::time::{Duration, SystemTime};
-use tokio::sync::mpsc::error::{SendError};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 
 #[derive(Clone)]
 struct Repository {
-    sql_request_sender: BlockingSender<SqlRequest>,
-    body_request_sender: BlockingSender<BodyRequest>,
+    info_request_sender: mpsc::Sender::<PageInfoRequest>,
+    body_request_sender: mpsc::Sender::<PageBodyRequest>,
 }
 
-fn blocking_channel<T>(buffer: usize) -> (BlockingSender<T>, BlockingReceiver<T>) {
-    let (sender, receiver) = mpsc::channel::<T>(buffer);
-    (
-        BlockingSender {
-            inner: sender,
-        },
-        BlockingReceiver {
-            inner: receiver,
-        },
-    )
-}
-
-struct BlockingSender<T> {
-    inner: mpsc::Sender<T>,
-}
-
-impl<T> BlockingSender<T> {
-    async fn send(&self, value: T) -> Result<(), SendError<T>> {
-        self.inner.send(value).await
-    }
-}
-
-impl<T> Clone for BlockingSender<T> {
-    fn clone(&self) -> Self {
-        BlockingSender {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-struct BlockingReceiver<T> {
-    inner: mpsc::Receiver<T>,
-}
-
-impl<T> BlockingReceiver<T> {
-    fn blocking_recv(&mut self) -> Option<T> {
-        self.inner.blocking_recv()
-    }
-}
-
-struct SqlRequest {
+struct PageInfoRequest {
     path: String,
-    page_sender: oneshot::Sender<rusqlite::Result<Option<PageInfo>>>,
+    info_sender: oneshot::Sender<rusqlite::Result<Option<PageInfo>>>,
 }
 
-struct BodyRequest {
+struct PageBodyRequest {
     row_id: i64,
     byte_range: Range<usize>,
     body_sender: oneshot::Sender<rusqlite::Result<Vec<u8>>>,
@@ -73,25 +32,25 @@ struct BodyRequest {
 
 impl Repository {
     fn new(
-        sql_request_sender: BlockingSender<SqlRequest>,
-        body_request_sender: BlockingSender<BodyRequest>,
+        info_request_sender: mpsc::Sender<PageInfoRequest>,
+        body_request_sender: mpsc::Sender<PageBodyRequest>,
     ) -> Repository {
         Repository {
-            sql_request_sender,
+            info_request_sender,
             body_request_sender,
         }
     }
 
     async fn get_response_for_path(&self, path: &str) -> hyper::http::Result<Response<Body>> {
-        let (page_sender, page_receiver) = oneshot::channel();
+        let (info_sender, info_receiver) = oneshot::channel();
 
         let _ = &self
-            .sql_request_sender
+            .info_request_sender
             .clone()
             .send(
-                SqlRequest {
+                PageInfoRequest {
                     path: path.to_string(),
-                    page_sender,
+                    info_sender,
                 }
             )
             .await;
@@ -99,7 +58,7 @@ impl Repository {
         // TODO:
         // timeout here and at the other send points,
         // or somehow wrap the timeout around the caller of this function?
-        let page_response = timeout(Duration::from_secs(1), page_receiver).await;
+        let page_response = timeout(Duration::from_secs(1), info_receiver).await;
 
         match page_response {
             Err(_elapsed) => Response::builder()
@@ -127,7 +86,7 @@ impl Repository {
                     let (body_sender, body_receiver) = oneshot::channel();
                     let _ = body_request_sender
                         .send(
-                            BodyRequest {
+                            PageBodyRequest {
                                 row_id,
                                 byte_range: (0..BLOCK_SIZE_BYTES),
                                 body_sender,
@@ -148,7 +107,7 @@ impl Repository {
                         while next_start < content_length {
                             let (body_sender, body_receiver) = oneshot::channel();
                             let byte_range = next_start..(next_start + BLOCK_SIZE_BYTES);
-                            let _ = body_request_sender.send(BodyRequest {
+                            let _ = body_request_sender.send(PageBodyRequest {
                                     row_id,
                                     byte_range,
                                     body_sender,
@@ -204,12 +163,12 @@ async fn get_response(
 
 #[tokio::main]
 async fn main() {
-    let (sql_request_sender, sql_request_receiver) = blocking_channel::<SqlRequest>(4);
-    let (body_request_sender, body_request_receiver) = blocking_channel::<BodyRequest>(4);
-    let repository = Repository::new(sql_request_sender, body_request_sender);
+    let (info_request_sender, info_request_receiver) = mpsc::channel::<PageInfoRequest>(4);
+    let (body_request_sender, body_request_receiver) = mpsc::channel::<PageBodyRequest>(4);
+    let repository = Repository::new(info_request_sender, body_request_sender);
 
     // threads to make blocking calls to the database
-    let _ = spawn_blocking(move || db_read_page_task(sql_request_receiver));
+    let _ = spawn_blocking(move || db_read_page_task(info_request_receiver));
 
     let _ = spawn_blocking(move || db_read_body_task(body_request_receiver));
 
@@ -233,20 +192,20 @@ async fn main() {
     }
 }
 
-fn db_read_page_task(mut sql_request_receiver: BlockingReceiver<SqlRequest>) {
+fn db_read_page_task(mut info_request_receiver: mpsc::Receiver<PageInfoRequest>) {
     let conn = Connection::open_with_flags(
         "site.db",
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .expect("connect to db");
 
-    while let Some(request) = sql_request_receiver.blocking_recv() {
+    while let Some(request) = info_request_receiver.blocking_recv() {
         let page = get_page_info_from_database(&request.path, &conn);
-        let _ = request.page_sender.send(page);
+        let _ = request.info_sender.send(page);
     }
 }
 
-fn db_read_body_task(mut body_request_receiver: BlockingReceiver<BodyRequest>) {
+fn db_read_body_task(mut body_request_receiver: mpsc::Receiver<PageBodyRequest>) {
     let conn = Connection::open_with_flags(
         "site.db",
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
