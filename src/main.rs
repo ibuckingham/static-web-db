@@ -1,6 +1,6 @@
 use httpdate::HttpDate;
 use hyper::body::Bytes;
-use hyper::server::conn::{AddrStream};
+use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{header, Body, Method, Request, Response, Server, StatusCode};
 use rusqlite::blob::Blob;
@@ -9,14 +9,18 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::ops::{Add, Range};
 use std::time::{Duration, SystemTime};
+use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 
+const BLOCK_SIZE_BYTES: usize = 16 * 1024;
+
 #[derive(Clone)]
 struct Repository {
-    info_request_sender: mpsc::Sender::<PageInfoRequest>,
-    body_request_sender: mpsc::Sender::<PageBodyRequest>,
+    // channels to get page data from db tasks
+    info_request_sender: mpsc::Sender<PageInfoRequest>,
+    body_request_sender: mpsc::Sender<PageBodyRequest>,
 }
 
 struct PageInfoRequest {
@@ -47,12 +51,10 @@ impl Repository {
         let _ = &self
             .info_request_sender
             .clone()
-            .send(
-                PageInfoRequest {
-                    path: path.to_string(),
-                    info_sender,
-                }
-            )
+            .send(PageInfoRequest {
+                path: path.to_string(),
+                info_sender,
+            })
             .await;
 
         // TODO:
@@ -79,50 +81,13 @@ impl Repository {
                 let row_id = info.row_id;
                 let content_length = info.content_length;
                 let body_request_sender = self.body_request_sender.clone();
-                const BLOCK_SIZE_BYTES: usize = 16 * 1024;
 
                 let body = if content_length <= BLOCK_SIZE_BYTES {
-                    // get entire response
-                    let (body_sender, body_receiver) = oneshot::channel();
-                    let _ = body_request_sender
-                        .send(
-                            PageBodyRequest {
-                                row_id,
-                                byte_range: (0..BLOCK_SIZE_BYTES),
-                                body_sender,
-                            }
-                        )
-                        .await;
-
-                    let body_vec = body_receiver
-                        .await
-                        .expect("body received")
-                        .expect("no db errors");
-                    Body::from(body_vec)
-                } else {
-                    // return chunked response
-                    let body_stream = async_stream::stream! {
-                        let mut next_start = 0_usize;
-
-                        while next_start < content_length {
-                            let (body_sender, body_receiver) = oneshot::channel();
-                            let byte_range = next_start..(next_start + BLOCK_SIZE_BYTES);
-                            let _ = body_request_sender.send(PageBodyRequest {
-                                    row_id,
-                                    byte_range,
-                                    body_sender,
-                                })
-                                .await;
-
-                            let body_vec = body_receiver.await.expect("body received").expect("no db errors");
-                            let bytes = Bytes::from(body_vec);
-                            yield Result::<Bytes, std::io::Error>::Ok(bytes);
-                            next_start += BLOCK_SIZE_BYTES;
-                        };
+                        Self::get_body_entire(row_id, &body_request_sender).await
+                    } else {
+                        // return chunked response
+                        Self::get_body_streamed(row_id, content_length, body_request_sender)
                     };
-
-                    Body::wrap_stream(body_stream)
-                };
 
                 Response::builder()
                     .header(header::CONTENT_TYPE, ct)
@@ -130,6 +95,54 @@ impl Repository {
                     .body(body)
             }
         }
+    }
+
+    async fn get_body_entire(row_id: i64, body_request_sender: &Sender<PageBodyRequest>) -> Body {
+        // get entire response
+        let body_bytes =
+            Self::get_body_range(row_id, 0..BLOCK_SIZE_BYTES, &body_request_sender).await;
+        Body::from(body_bytes)
+    }
+
+    fn get_body_streamed(
+        row_id: i64,
+        content_length: usize,
+        body_request_sender: Sender<PageBodyRequest>,
+    ) -> Body {
+        let body_stream = async_stream::stream! {
+            let mut next_start = 0_usize;
+
+            while next_start < content_length {
+                let byte_range = next_start..(next_start + BLOCK_SIZE_BYTES);
+                let body_bytes = Self::get_body_range(row_id, byte_range, &body_request_sender).await;
+
+                let bytes = Bytes::from(body_bytes);
+                yield Result::<Bytes, std::io::Error>::Ok(bytes);
+                next_start += BLOCK_SIZE_BYTES;
+            };
+        };
+
+        Body::wrap_stream(body_stream)
+    }
+
+    async fn get_body_range(
+        row_id: i64,
+        byte_range: Range<usize>,
+        body_request_sender: &Sender<PageBodyRequest>,
+    ) -> Vec<u8> {
+        let (body_sender, body_receiver) = oneshot::channel();
+        let _ = body_request_sender
+            .send(PageBodyRequest {
+                row_id,
+                byte_range,
+                body_sender,
+            })
+            .await;
+
+        body_receiver
+            .await
+            .expect("body received")
+            .expect("no db errors")
     }
 }
 
@@ -142,7 +155,8 @@ struct PageInfo {
 
 impl PageInfo {
     fn format_last_modified_timestamp(&self) -> String {
-        let last_modified_systime = SystemTime::UNIX_EPOCH.add(Duration::from_secs(self.last_modified_uxt));
+        let last_modified_systime =
+            SystemTime::UNIX_EPOCH.add(Duration::from_secs(self.last_modified_uxt));
         let http_date = HttpDate::from(last_modified_systime);
         http_date.to_string()
     }
@@ -163,17 +177,24 @@ async fn get_response(
 
 #[tokio::main]
 async fn main() {
-    let (info_request_sender, info_request_receiver) = mpsc::channel::<PageInfoRequest>(4);
-    let (body_request_sender, body_request_receiver) = mpsc::channel::<PageBodyRequest>(4);
+    // database reads are blocking calls,
+    // so move that work into blocking threads,
+    // and request the data over channels.
+    // This separates the HTTP stuff from the DB stuff (ownership of connections etc),
+    // and allows reading blocks from the database to be interleaved
+    // with writing chunked responses
+    const DB_INFLIGHT_COUNT: usize = 4;
+    let (info_request_sender, info_request_receiver) =
+        mpsc::channel::<PageInfoRequest>(DB_INFLIGHT_COUNT);
+    let (body_request_sender, body_request_receiver) =
+        mpsc::channel::<PageBodyRequest>(DB_INFLIGHT_COUNT);
     let repository = Repository::new(info_request_sender, body_request_sender);
 
-    // threads to make blocking calls to the database
-    let _ = spawn_blocking(move || db_read_page_task(info_request_receiver));
+    let _ = spawn_blocking(move || db_read_page_infos_task(info_request_receiver));
+    let _ = spawn_blocking(move || db_read_page_bodies_task(body_request_receiver));
 
-    let _ = spawn_blocking(move || db_read_body_task(body_request_receiver));
-
-    // A `Service` is needed for every connection, so this
-    // creates one
+    // A `Service` is needed for every connection,
+    // so this creates one
     let make_service = make_service_fn(|_conn: &AddrStream| {
         let repository = repository.clone();
         let service = service_fn(move |req| get_response(repository.clone(), req));
@@ -192,7 +213,7 @@ async fn main() {
     }
 }
 
-fn db_read_page_task(mut info_request_receiver: mpsc::Receiver<PageInfoRequest>) {
+fn db_read_page_infos_task(mut info_request_receiver: mpsc::Receiver<PageInfoRequest>) {
     let conn = Connection::open_with_flags(
         "site.db",
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -205,7 +226,7 @@ fn db_read_page_task(mut info_request_receiver: mpsc::Receiver<PageInfoRequest>)
     }
 }
 
-fn db_read_body_task(mut body_request_receiver: mpsc::Receiver<PageBodyRequest>) {
+fn db_read_page_bodies_task(mut body_request_receiver: mpsc::Receiver<PageBodyRequest>) {
     let conn = Connection::open_with_flags(
         "site.db",
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -233,7 +254,7 @@ fn get_page_info_from_database(
         let content_length = row.get(3)?;
 
         Ok(PageInfo {
-            last_modified_uxt: lm ,
+            last_modified_uxt: lm,
             content_type: ct,
             content_length,
             row_id,
