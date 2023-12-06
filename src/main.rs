@@ -1,14 +1,19 @@
-use httpdate::HttpDate;
-use hyper::body::Bytes;
-use hyper::server::conn::AddrStream;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{header, Body, Method, Request, Response, Server, StatusCode};
-use rusqlite::blob::Blob;
-use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::ops::{Add, Range};
 use std::time::{Duration, SystemTime};
+
+use http_body::Frame;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use httpdate::HttpDate;
+use hyper::body::Bytes;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{header, Method, Request, Response, StatusCode};
+use rusqlite::blob::Blob;
+use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::spawn_blocking;
@@ -45,7 +50,10 @@ impl Repository {
         }
     }
 
-    async fn get_response_for_path(&self, path: &str) -> hyper::http::Result<Response<Body>> {
+    async fn get_response_for_path(
+        &self,
+        path: &str,
+    ) -> hyper::http::Result<Response<BoxBody<Bytes, Infallible>>> {
         let (info_sender, info_receiver) = oneshot::channel();
 
         let _ = &self
@@ -65,16 +73,16 @@ impl Repository {
         match page_response {
             Err(_elapsed) => Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
-                .body(Body::empty()),
+                .body(BoxBody::default()),
             Ok(Err(e)) => Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from(e.to_string())),
+                .body(http_body_util::Full::from(e.to_string()).boxed()),
             Ok(Ok(Err(e))) => Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from(e.to_string())),
+                .body(http_body_util::Full::from(e.to_string()).boxed()),
             Ok(Ok(Ok(None))) => Response::builder()
                 .status(StatusCode::NOT_FOUND)
-                .body(Body::empty()),
+                .body(BoxBody::default()),
             Ok(Ok(Ok(Some(info)))) => {
                 let ct = &info.content_type;
                 let lm = info.format_last_modified_timestamp();
@@ -83,11 +91,13 @@ impl Repository {
                 let body_request_sender = self.body_request_sender.clone();
 
                 let body = if content_length <= BLOCK_SIZE_BYTES {
-                        Self::get_body_entire(row_id, &body_request_sender).await
-                    } else {
-                        // return chunked response
-                        Self::get_body_streamed(row_id, content_length, body_request_sender)
-                    };
+                    Self::get_body_entire(row_id, &body_request_sender)
+                        .await
+                        .boxed()
+                } else {
+                    // return chunked response
+                    Self::get_body_streamed(row_id, content_length, body_request_sender)
+                };
 
                 Response::builder()
                     .header(header::CONTENT_TYPE, ct)
@@ -96,19 +106,22 @@ impl Repository {
             }
         }
     }
-
-    async fn get_body_entire(row_id: i64, body_request_sender: &Sender<PageBodyRequest>) -> Body {
+    //
+    async fn get_body_entire(
+        row_id: i64,
+        body_request_sender: &Sender<PageBodyRequest>,
+    ) -> Full<Bytes> {
         // get entire response
         let body_bytes =
-            Self::get_body_range(row_id, 0..BLOCK_SIZE_BYTES, &body_request_sender).await;
-        Body::from(body_bytes)
+            Self::get_body_range(row_id, 0..BLOCK_SIZE_BYTES, body_request_sender).await;
+        http_body_util::Full::from(body_bytes)
     }
 
     fn get_body_streamed(
         row_id: i64,
         content_length: usize,
         body_request_sender: Sender<PageBodyRequest>,
-    ) -> Body {
+    ) -> BoxBody<Bytes, Infallible> {
         let body_stream = async_stream::stream! {
             let mut next_start = 0_usize;
 
@@ -117,12 +130,13 @@ impl Repository {
                 let body_bytes = Self::get_body_range(row_id, byte_range, &body_request_sender).await;
 
                 let bytes = Bytes::from(body_bytes);
-                yield Result::<Bytes, std::io::Error>::Ok(bytes);
+                let frame = Frame::data(bytes);
+                yield Result::<Frame<Bytes>, Infallible>::Ok(frame);
                 next_start += BLOCK_SIZE_BYTES;
             };
         };
 
-        Body::wrap_stream(body_stream)
+        StreamBody::new(body_stream).boxed()
     }
 
     async fn get_body_range(
@@ -164,14 +178,14 @@ impl PageInfo {
 
 async fn get_response(
     repository: Repository,
-    req: Request<Body>,
-) -> hyper::http::Result<Response<Body>> {
+    req: Request<hyper::body::Incoming>,
+) -> hyper::http::Result<Response<BoxBody<Bytes, Infallible>>> {
     // only allow GET methods
     match (req.method(), req.uri().path()) {
         (&Method::GET, path) => repository.get_response_for_path(path).await,
         _ => Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
-            .body(Body::empty()),
+            .body(BoxBody::default()),
     }
 }
 
@@ -193,23 +207,32 @@ async fn main() {
     let _ = spawn_blocking(move || db_read_page_infos_task(info_request_receiver));
     let _ = spawn_blocking(move || db_read_page_bodies_task(body_request_receiver));
 
-    // A `Service` is needed for every connection,
-    // so this creates one
-    let make_service = make_service_fn(|_conn: &AddrStream| {
-        let repository = repository.clone();
-        let service = service_fn(move |req| get_response(repository.clone(), req));
-
-        // return the service to hyper
-        async move { Ok::<_, Infallible>(service) }
-    });
-
     // We'll bind to 127.0.0.1:8080
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
-    let server = Server::bind(&addr).serve(make_service);
+    let listener = TcpListener::bind(addr).await.expect("tcp listener bound");
 
-    // Run this server for... forever!
-    if let Err(e) = server.await {
-        eprintln!("server error: {}", e);
+    loop {
+        let (stream, _) = listener.accept().await.expect("listener accepted");
+
+        // Use an adapter to access something implementing `tokio::io` traits as if they implement
+        // `hyper::rt` IO traits.
+        let io = hyper_util::rt::TokioIo::new(stream);
+
+        let repository = repository.clone();
+        // Spawn a tokio task to serve multiple connections concurrently
+        tokio::task::spawn(async move {
+            // Finally, we bind the incoming connection to our `hello` service
+            if let Err(err) = http1::Builder::new()
+                // `service_fn` converts our function in a `Service`
+                .serve_connection(
+                    io,
+                    service_fn(move |req| get_response(repository.clone(), req)),
+                )
+                .await
+            {
+                println!("Error serving connection: {:?}", err);
+            }
+        });
     }
 }
 
@@ -222,7 +245,7 @@ fn db_read_page_infos_task(mut info_request_receiver: mpsc::Receiver<PageInfoReq
 
     while let Some(request) = info_request_receiver.blocking_recv() {
         let page = get_page_info_from_database(&request.path, &conn);
-        let _ = request.info_sender.send(page);
+        let _ignore_dropped_receiver = request.info_sender.send(page);
     }
 }
 
@@ -235,7 +258,7 @@ fn db_read_page_bodies_task(mut body_request_receiver: mpsc::Receiver<PageBodyRe
 
     while let Some(request) = body_request_receiver.blocking_recv() {
         let body = get_body_buf_from_db(request.row_id, request.byte_range, &conn);
-        let _ = request.body_sender.send(body);
+        let _ignore_dropped_receiver = request.body_sender.send(body);
     }
 }
 
@@ -270,9 +293,7 @@ fn get_body_buf_from_db(
 ) -> rusqlite::Result<Vec<u8>> {
     let body_blob: Blob = conn.blob_open(DatabaseName::Main, "pages", "body", row_id, true)?;
 
-    let mut buf = Vec::<u8>::with_capacity(byte_range.len());
-    buf.resize(byte_range.len(), 0);
-
+    let mut buf = vec![0u8; byte_range.len()];
     let read_length = body_blob.read_at(&mut buf, byte_range.start)?;
 
     buf.resize(read_length, 0);
