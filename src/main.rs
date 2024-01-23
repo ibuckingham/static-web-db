@@ -24,8 +24,8 @@ const BLOCK_SIZE_BYTES: usize = 16 * 1024;
 #[derive(Clone)]
 struct Repository {
     // channels to get page data from db tasks
-    info_request_sender: mpsc::Sender<PageInfoRequest>,
-    body_request_sender: mpsc::Sender<PageBodyRequest>,
+    info_request_sender: Sender<PageInfoRequest>,
+    body_request_sender: Sender<PageBodyRequest>,
 }
 
 struct PageInfoRequest {
@@ -36,13 +36,13 @@ struct PageInfoRequest {
 struct PageBodyRequest {
     row_id: i64,
     byte_range: Range<usize>,
-    body_sender: oneshot::Sender<rusqlite::Result<Vec<u8>>>,
+    body_sender: oneshot::Sender<rusqlite::Result<Box<[u8]>>>,
 }
 
 impl Repository {
     fn new(
-        info_request_sender: mpsc::Sender<PageInfoRequest>,
-        body_request_sender: mpsc::Sender<PageBodyRequest>,
+        info_request_sender: Sender<PageInfoRequest>,
+        body_request_sender: Sender<PageBodyRequest>,
     ) -> Repository {
         Repository {
             info_request_sender,
@@ -84,10 +84,11 @@ impl Repository {
                 .status(StatusCode::NOT_FOUND)
                 .body(BoxBody::default()),
             Ok(Ok(Ok(Some(info)))) => {
-                let ct = &info.content_type;
                 let lm = info.format_last_modified_timestamp();
+                let ct = info.content_type;
                 let row_id = info.row_id;
                 let content_length = info.content_length;
+
                 let body_request_sender = self.body_request_sender.clone();
 
                 let body = if content_length <= BLOCK_SIZE_BYTES {
@@ -106,7 +107,7 @@ impl Repository {
             }
         }
     }
-    //
+
     async fn get_body_entire(
         row_id: i64,
         body_request_sender: &Sender<PageBodyRequest>,
@@ -114,7 +115,8 @@ impl Repository {
         // get entire response
         let body_bytes =
             Self::get_body_range(row_id, 0..BLOCK_SIZE_BYTES, body_request_sender).await;
-        http_body_util::Full::from(body_bytes)
+        let bytes = Bytes::from(body_bytes);
+        http_body_util::Full::from(bytes)
     }
 
     fn get_body_streamed(
@@ -143,7 +145,7 @@ impl Repository {
         row_id: i64,
         byte_range: Range<usize>,
         body_request_sender: &Sender<PageBodyRequest>,
-    ) -> Vec<u8> {
+    ) -> Box<[u8]> {
         let (body_sender, body_receiver) = oneshot::channel();
         let _ = body_request_sender
             .send(PageBodyRequest {
@@ -197,11 +199,16 @@ async fn main() {
     // This separates the HTTP stuff from the DB stuff (ownership of connections etc),
     // and allows reading blocks from the database to be interleaved
     // with writing chunked responses
+
+    // allow a limited amount of queuing of requests to the database
+    // so that
     const DB_INFLIGHT_COUNT: usize = 4;
+
     let (info_request_sender, info_request_receiver) =
         mpsc::channel::<PageInfoRequest>(DB_INFLIGHT_COUNT);
     let (body_request_sender, body_request_receiver) =
         mpsc::channel::<PageBodyRequest>(DB_INFLIGHT_COUNT);
+
     let repository = Repository::new(info_request_sender, body_request_sender);
 
     let _ = spawn_blocking(move || db_read_page_infos_task(info_request_receiver));
@@ -290,12 +297,15 @@ fn get_body_buf_from_db(
     row_id: i64,
     byte_range: Range<usize>,
     conn: &Connection,
-) -> rusqlite::Result<Vec<u8>> {
+) -> rusqlite::Result<Box<[u8]>> {
     let body_blob: Blob = conn.blob_open(DatabaseName::Main, "pages", "body", row_id, true)?;
 
     let mut buf = vec![0u8; byte_range.len()];
-    let read_length = body_blob.read_at(&mut buf, byte_range.start)?;
+    let _read_length = body_blob.read_at(&mut buf, byte_range.start)?;
+    // log partial reads?
 
-    buf.resize(read_length, 0);
-    Ok(buf)
+    // buf.resize(read_length, 0);
+
+    // if there was a partial read then this may (will?) first copy to a smaller buffer
+    Ok(buf.into_boxed_slice())
 }
