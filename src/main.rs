@@ -1,23 +1,23 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::ops::{Add, Range};
-use std::time::{Duration, SystemTime};
+use std::ops::Range;
+use std::time::Duration;
 
+use flume::Sender;
 use http_body::Frame;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
-use httpdate::HttpDate;
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{header, Method, Request, Response, StatusCode};
-use rusqlite::blob::Blob;
-use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc::Sender;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
+use db::{PageBodyRequest, PageInfoRequest};
+
+mod db;
 
 const BLOCK_SIZE_BYTES: usize = 16 * 1024;
 
@@ -26,17 +26,6 @@ struct Repository {
     // channels to get page data from db tasks
     info_request_sender: Sender<PageInfoRequest>,
     body_request_sender: Sender<PageBodyRequest>,
-}
-
-struct PageInfoRequest {
-    path: String,
-    info_sender: oneshot::Sender<rusqlite::Result<Option<PageInfo>>>,
-}
-
-struct PageBodyRequest {
-    row_id: i64,
-    byte_range: Range<usize>,
-    body_sender: oneshot::Sender<rusqlite::Result<Box<[u8]>>>,
 }
 
 impl Repository {
@@ -59,7 +48,7 @@ impl Repository {
         let _ = &self
             .info_request_sender
             .clone()
-            .send(PageInfoRequest {
+            .send_async(PageInfoRequest {
                 path: path.to_string(),
                 info_sender,
             })
@@ -92,7 +81,7 @@ impl Repository {
                 let body_request_sender = self.body_request_sender.clone();
 
                 let body = if content_length <= BLOCK_SIZE_BYTES {
-                    Self::get_body_entire(row_id, &body_request_sender)
+                    Self::get_body_entire(row_id, &body_request_sender, content_length)
                         .await
                         .boxed()
                 } else {
@@ -111,10 +100,11 @@ impl Repository {
     async fn get_body_entire(
         row_id: i64,
         body_request_sender: &Sender<PageBodyRequest>,
+        content_length: usize,
     ) -> Full<Bytes> {
         // get entire response
         let body_bytes =
-            Self::get_body_range(row_id, 0..BLOCK_SIZE_BYTES, body_request_sender).await;
+            Self::get_body_range(row_id, 0..content_length, body_request_sender).await;
         let bytes = Bytes::from(body_bytes);
         http_body_util::Full::from(bytes)
     }
@@ -128,13 +118,14 @@ impl Repository {
             let mut next_start = 0_usize;
 
             while next_start < content_length {
-                let byte_range = next_start..(next_start + BLOCK_SIZE_BYTES);
+                let next_end = std::cmp::min(next_start + BLOCK_SIZE_BYTES, content_length);
+                let byte_range = next_start..next_end;
                 let body_bytes = Self::get_body_range(row_id, byte_range, &body_request_sender).await;
 
                 let bytes = Bytes::from(body_bytes);
                 let frame = Frame::data(bytes);
                 yield Result::<Frame<Bytes>, Infallible>::Ok(frame);
-                next_start += BLOCK_SIZE_BYTES;
+                next_start = next_end;
             };
         };
 
@@ -148,7 +139,7 @@ impl Repository {
     ) -> Box<[u8]> {
         let (body_sender, body_receiver) = oneshot::channel();
         let _ = body_request_sender
-            .send(PageBodyRequest {
+            .send_async(PageBodyRequest {
                 row_id,
                 byte_range,
                 body_sender,
@@ -159,22 +150,6 @@ impl Repository {
             .await
             .expect("body received")
             .expect("no db errors")
-    }
-}
-
-struct PageInfo {
-    last_modified_uxt: u64,
-    content_type: String,
-    content_length: usize,
-    row_id: i64,
-}
-
-impl PageInfo {
-    fn format_last_modified_timestamp(&self) -> String {
-        let last_modified_systime =
-            SystemTime::UNIX_EPOCH.add(Duration::from_secs(self.last_modified_uxt));
-        let http_date = HttpDate::from(last_modified_systime);
-        http_date.to_string()
     }
 }
 
@@ -205,14 +180,22 @@ async fn main() {
     const DB_INFLIGHT_COUNT: usize = 4;
 
     let (info_request_sender, info_request_receiver) =
-        mpsc::channel::<PageInfoRequest>(DB_INFLIGHT_COUNT);
+        flume::bounded::<PageInfoRequest>(DB_INFLIGHT_COUNT);
     let (body_request_sender, body_request_receiver) =
-        mpsc::channel::<PageBodyRequest>(DB_INFLIGHT_COUNT);
+        flume::bounded::<PageBodyRequest>(DB_INFLIGHT_COUNT);
 
     let repository = Repository::new(info_request_sender, body_request_sender);
 
-    let _ = spawn_blocking(move || db_read_page_infos_task(info_request_receiver));
-    let _ = spawn_blocking(move || db_read_page_bodies_task(body_request_receiver));
+    const DB_RECEIVER_COUNT: i32 = 2;
+    for i in 0..DB_RECEIVER_COUNT {
+        let r = info_request_receiver.clone();
+        let _ = spawn_blocking(move || db::db_read_page_infos_task(i, r));
+    }
+
+    for i in 0..DB_RECEIVER_COUNT {
+        let r = body_request_receiver.clone();
+        let _ = spawn_blocking(move || db::db_read_page_bodies_task(i, r));
+    }
 
     // We'll bind to 127.0.0.1:8080
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
@@ -241,71 +224,4 @@ async fn main() {
             }
         });
     }
-}
-
-fn db_read_page_infos_task(mut info_request_receiver: mpsc::Receiver<PageInfoRequest>) {
-    let conn = Connection::open_with_flags(
-        "site.db",
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .expect("connect to db");
-
-    while let Some(request) = info_request_receiver.blocking_recv() {
-        let page = get_page_info_from_database(&request.path, &conn);
-        let _ignore_dropped_receiver = request.info_sender.send(page);
-    }
-}
-
-fn db_read_page_bodies_task(mut body_request_receiver: mpsc::Receiver<PageBodyRequest>) {
-    let conn = Connection::open_with_flags(
-        "site.db",
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .expect("connect to db");
-
-    while let Some(request) = body_request_receiver.blocking_recv() {
-        let body = get_body_buf_from_db(request.row_id, request.byte_range, &conn);
-        let _ignore_dropped_receiver = request.body_sender.send(body);
-    }
-}
-
-fn get_page_info_from_database(
-    path: &str,
-    conn: &Connection,
-) -> rusqlite::Result<Option<PageInfo>> {
-    let mut stmt = conn
-        .prepare("select last_modified_uxt, content_type, rowid, length(body) as content_length from pages where path = ?")
-        .expect("SQL statement prepared");
-
-    stmt.query_row([path], |row| {
-        let lm = row.get(0)?;
-        let ct = row.get(1)?;
-        let row_id = row.get(2)?;
-        let content_length = row.get(3)?;
-
-        Ok(PageInfo {
-            last_modified_uxt: lm,
-            content_type: ct,
-            content_length,
-            row_id,
-        })
-    })
-    .optional()
-}
-
-fn get_body_buf_from_db(
-    row_id: i64,
-    byte_range: Range<usize>,
-    conn: &Connection,
-) -> rusqlite::Result<Box<[u8]>> {
-    let body_blob: Blob = conn.blob_open(DatabaseName::Main, "pages", "body", row_id, true)?;
-
-    let mut buf = vec![0u8; byte_range.len()];
-    let _read_length = body_blob.read_at(&mut buf, byte_range.start)?;
-    // log partial reads?
-
-    // buf.resize(read_length, 0);
-
-    // if there was a partial read then this may (will?) first copy to a smaller buffer
-    Ok(buf.into_boxed_slice())
 }
