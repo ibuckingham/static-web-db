@@ -1,4 +1,4 @@
-use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension, Statement};
 use std::ops::{Add, Range};
 use rusqlite::blob::Blob;
 use tokio::sync::oneshot;
@@ -39,9 +39,13 @@ pub fn db_read_page_infos_task(_i: i32, info_request_receiver: flume::Receiver<P
     )
     .expect("connect to db");
 
+    let mut stmt = conn
+        .prepare("select last_modified_uxt, content_type, rowid, length(body) as content_length from pages where path = ?")
+        .expect("SQL statement prepared");
+
     while let Ok(request) = info_request_receiver.recv() {
         // println!("info from {i}");
-        let page = get_page_info_from_database(&request.path, &conn);
+        let page = get_page_info_from_database(&mut stmt, &request.path);
         let _ignore_dropped_receiver = request.info_sender.send(page);
     }
 }
@@ -61,12 +65,9 @@ pub fn db_read_page_bodies_task(_i: i32, body_request_receiver: flume::Receiver<
 }
 
 fn get_page_info_from_database(
-    path: &str,
-    conn: &Connection,
+    stmt: &mut Statement,
+    path: &str
 ) -> rusqlite::Result<Option<PageInfo>> {
-    let mut stmt = conn
-        .prepare("select last_modified_uxt, content_type, rowid, length(body) as content_length from pages where path = ?")
-        .expect("SQL statement prepared");
 
     stmt.query_row([path], |row| {
         let lm = row.get(0)?;
@@ -100,4 +101,3 @@ fn get_body_buf_from_db(
     // if there was a partial read then this may (will?) first copy to a smaller buffer
     Ok(buf.into_boxed_slice())
 }
-
