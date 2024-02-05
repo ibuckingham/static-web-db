@@ -1,25 +1,23 @@
+use httpdate::HttpDate;
+use rusqlite::blob::Blob;
 use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension, Statement};
 use std::ops::{Add, Range};
-use rusqlite::blob::Blob;
-use tokio::sync::oneshot;
 use std::time::{Duration, SystemTime};
-use httpdate::HttpDate;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
+
+const BLOCK_SIZE_BYTES: usize = 16 * 1024;
 
 pub struct PageInfoRequest {
     pub path: String,
     pub info_sender: oneshot::Sender<rusqlite::Result<Option<PageInfo>>>,
-}
-
-pub struct PageBodyRequest {
-    pub row_id: i64,
-    pub byte_range: Range<usize>,
-    pub body_sender: oneshot::Sender<rusqlite::Result<Box<[u8]>>>,
+    pub body_sender: tokio::sync::mpsc::UnboundedSender<Box<[u8]>>,
 }
 
 pub struct PageInfo {
     pub content_type: String,
     pub content_length: usize,
-    pub row_id: i64,
+    row_id: i64,
     last_modified_uxt: u64,
 }
 
@@ -45,30 +43,65 @@ pub fn db_read_page_infos_task(_i: i32, info_request_receiver: flume::Receiver<P
 
     while let Ok(request) = info_request_receiver.recv() {
         // println!("info from {i}");
-        let page = get_page_info_from_database(&mut stmt, &request.path);
-        let _ignore_dropped_receiver = request.info_sender.send(page);
+        handle_resource_request(&conn, &mut stmt, request);
     }
 }
 
-pub fn db_read_page_bodies_task(_i: i32, body_request_receiver: flume::Receiver<PageBodyRequest>) {
-    let conn = Connection::open_with_flags(
-        "site.db",
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .expect("connect to db");
+fn handle_resource_request(conn: &Connection, mut stmt: &mut Statement, request: PageInfoRequest) {
+    let page = get_page_info_from_database(&mut stmt, &request.path);
+    match page {
+        Ok(Some(info)) => {
+            let row_id = info.row_id;
+            let content_length = info.content_length;
 
-    while let Ok(request) = body_request_receiver.recv() {
-        // println!("body from {i}");
-        let body = get_body_buf_from_db(request.row_id, request.byte_range, &conn);
-        let _ignore_dropped_receiver = request.body_sender.send(body);
+            if request.info_sender.send(Ok(Some(info))).is_err() {
+                return;
+            };
+
+            send_content_blocks(&conn, request.body_sender, row_id, content_length);
+        }
+        _ => {
+            let _ignore_dropped_receiver = request.info_sender.send(page);
+        }
+    }
+}
+
+fn send_content_blocks(
+    conn: &Connection,
+    sender: UnboundedSender<Box<[u8]>>,
+    row_id: i64,
+    content_length: usize,
+) {
+    let mut next_start = 0_usize;
+
+    while next_start < content_length {
+        let next_end = std::cmp::min(next_start + BLOCK_SIZE_BYTES, content_length);
+        let byte_range = next_start..next_end;
+        let maybe_body = get_body_buf_from_db(conn, row_id, byte_range);
+        match maybe_body {
+            Ok(body) => {
+                let actual_length = body.len();
+                if actual_length == 0 || sender.send(body).is_err() {
+                    // nothing listening, so stop sending
+                    return;
+                };
+                next_start += actual_length;
+            }
+            _ => {
+                // TODO : db error while reading BLOB, stop sending - and report somehow?
+                // probably should immediately close the connection,
+                // so the 0-length terminating chunk isn't sent
+                // and the client is aware there was an interruption
+                return;
+            }
+        }
     }
 }
 
 fn get_page_info_from_database(
     stmt: &mut Statement,
-    path: &str
+    path: &str,
 ) -> rusqlite::Result<Option<PageInfo>> {
-
     stmt.query_row([path], |row| {
         let lm = row.get(0)?;
         let ct = row.get(1)?;
@@ -86,9 +119,9 @@ fn get_page_info_from_database(
 }
 
 fn get_body_buf_from_db(
+    conn: &Connection,
     row_id: i64,
     byte_range: Range<usize>,
-    conn: &Connection,
 ) -> rusqlite::Result<Box<[u8]>> {
     let body_blob: Blob = conn.blob_open(DatabaseName::Main, "pages", "body", row_id, true)?;
 

@@ -1,12 +1,12 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::ops::Range;
 use std::time::Duration;
 
+use db::PageInfoRequest;
 use flume::Sender;
 use http_body::Frame;
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full, StreamBody};
+use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -15,27 +15,19 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
-use db::{PageBodyRequest, PageInfoRequest};
 
 mod db;
-
-const BLOCK_SIZE_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
 struct Repository {
     // channels to get page data from db tasks
     info_request_sender: Sender<PageInfoRequest>,
-    body_request_sender: Sender<PageBodyRequest>,
 }
 
 impl Repository {
-    fn new(
-        info_request_sender: Sender<PageInfoRequest>,
-        body_request_sender: Sender<PageBodyRequest>,
-    ) -> Repository {
+    fn new(info_request_sender: Sender<PageInfoRequest>) -> Repository {
         Repository {
             info_request_sender,
-            body_request_sender,
         }
     }
 
@@ -44,6 +36,7 @@ impl Repository {
         path: &str,
     ) -> hyper::http::Result<Response<BoxBody<Bytes, Infallible>>> {
         let (info_sender, info_receiver) = oneshot::channel();
+        let (body_stream_sender, mut body_stream_receiver) = tokio::sync::mpsc::unbounded_channel();
 
         let _ = &self
             .info_request_sender
@@ -51,6 +44,7 @@ impl Repository {
             .send_async(PageInfoRequest {
                 path: path.to_string(),
                 info_sender,
+                body_sender: body_stream_sender,
             })
             .await;
 
@@ -73,83 +67,53 @@ impl Repository {
                 .status(StatusCode::NOT_FOUND)
                 .body(BoxBody::default()),
             Ok(Ok(Ok(Some(info)))) => {
-                let lm = info.format_last_modified_timestamp();
-                let ct = info.content_type;
-                let row_id = info.row_id;
-                let content_length = info.content_length;
+                match body_stream_receiver.recv().await {
+                    None => {
+                        // error, page exists but no content?
+                        Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(
+                                http_body_util::Full::from("Page exists but content not found")
+                                    .boxed(),
+                            )
+                    }
+                    Some(first_block) => {
+                        let lm = info.format_last_modified_timestamp();
+                        let ct = info.content_type;
+                        let content_length = info.content_length;
 
-                let body_request_sender = self.body_request_sender.clone();
+                        // if the body stream is still open, then use that?
+                        // if it's the whole content the return it,
+                        if first_block.len() >= content_length {
+                            let bytes = Bytes::from(first_block);
+                            let body = http_body_util::Full::from(bytes).boxed();
+                            return Response::builder()
+                                .header(header::CONTENT_TYPE, ct)
+                                .header(header::LAST_MODIFIED, lm)
+                                .body(body);
+                        }
 
-                let body = if content_length <= BLOCK_SIZE_BYTES {
-                    Self::get_body_entire(row_id, &body_request_sender, content_length)
-                        .await
-                        .boxed()
-                } else {
-                    // return chunked response
-                    Self::get_body_streamed(row_id, content_length, body_request_sender)
-                };
+                        // return stream of chunks until sender closed
+                        let mut next_block = Some(first_block);
+                        let body_stream = async_stream::stream! {
+                            while let Some(block) = next_block {
+                                let bytes = Bytes::from(block);
+                                let frame = Frame::data(bytes);
+                                yield Result::<Frame<Bytes>, Infallible>::Ok(frame);
 
-                Response::builder()
-                    .header(header::CONTENT_TYPE, ct)
-                    .header(header::LAST_MODIFIED, lm)
-                    .body(body)
+                                next_block = body_stream_receiver.recv().await;
+                            }
+                        };
+
+                        let body = StreamBody::new(body_stream).boxed();
+                        Response::builder()
+                            .header(header::CONTENT_TYPE, ct)
+                            .header(header::LAST_MODIFIED, lm)
+                            .body(body)
+                    }
+                }
             }
         }
-    }
-
-    async fn get_body_entire(
-        row_id: i64,
-        body_request_sender: &Sender<PageBodyRequest>,
-        content_length: usize,
-    ) -> Full<Bytes> {
-        // get entire response
-        let body_bytes =
-            Self::get_body_range(row_id, 0..content_length, body_request_sender).await;
-        let bytes = Bytes::from(body_bytes);
-        http_body_util::Full::from(bytes)
-    }
-
-    fn get_body_streamed(
-        row_id: i64,
-        content_length: usize,
-        body_request_sender: Sender<PageBodyRequest>,
-    ) -> BoxBody<Bytes, Infallible> {
-        let body_stream = async_stream::stream! {
-            let mut next_start = 0_usize;
-
-            while next_start < content_length {
-                let next_end = std::cmp::min(next_start + BLOCK_SIZE_BYTES, content_length);
-                let byte_range = next_start..next_end;
-                let body_bytes = Self::get_body_range(row_id, byte_range, &body_request_sender).await;
-
-                let bytes = Bytes::from(body_bytes);
-                let frame = Frame::data(bytes);
-                yield Result::<Frame<Bytes>, Infallible>::Ok(frame);
-                next_start = next_end;
-            };
-        };
-
-        StreamBody::new(body_stream).boxed()
-    }
-
-    async fn get_body_range(
-        row_id: i64,
-        byte_range: Range<usize>,
-        body_request_sender: &Sender<PageBodyRequest>,
-    ) -> Box<[u8]> {
-        let (body_sender, body_receiver) = oneshot::channel();
-        let _ = body_request_sender
-            .send_async(PageBodyRequest {
-                row_id,
-                byte_range,
-                body_sender,
-            })
-            .await;
-
-        body_receiver
-            .await
-            .expect("body received")
-            .expect("no db errors")
     }
 }
 
@@ -181,20 +145,13 @@ async fn main() {
 
     let (info_request_sender, info_request_receiver) =
         flume::bounded::<PageInfoRequest>(DB_INFLIGHT_COUNT);
-    let (body_request_sender, body_request_receiver) =
-        flume::bounded::<PageBodyRequest>(DB_INFLIGHT_COUNT);
 
-    let repository = Repository::new(info_request_sender, body_request_sender);
+    let repository = Repository::new(info_request_sender);
 
     const DB_RECEIVER_COUNT: i32 = 2;
     for i in 0..DB_RECEIVER_COUNT {
         let r = info_request_receiver.clone();
         let _ = spawn_blocking(move || db::db_read_page_infos_task(i, r));
-    }
-
-    for i in 0..DB_RECEIVER_COUNT {
-        let r = body_request_receiver.clone();
-        let _ = spawn_blocking(move || db::db_read_page_bodies_task(i, r));
     }
 
     // We'll bind to 127.0.0.1:8080
@@ -208,16 +165,14 @@ async fn main() {
         // `hyper::rt` IO traits.
         let io = hyper_util::rt::TokioIo::new(stream);
 
-        let repository = repository.clone();
+        let rep = repository.clone();
+
         // Spawn a tokio task to serve multiple connections concurrently
         tokio::task::spawn(async move {
             // Finally, we bind the incoming connection to our `hello` service
             if let Err(err) = http1::Builder::new()
                 // `service_fn` converts our function in a `Service`
-                .serve_connection(
-                    io,
-                    service_fn(move |req| get_response(repository.clone(), req)),
-                )
+                .serve_connection(io, service_fn(move |req| get_response(rep.clone(), req)))
                 .await
             {
                 println!("Error serving connection: {:?}", err);
