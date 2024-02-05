@@ -2,7 +2,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use db::PageInfoRequest;
+use db::ResourceRequest;
 use flume::Sender;
 use http_body::Frame;
 use http_body_util::combinators::BoxBody;
@@ -20,14 +20,13 @@ mod db;
 
 #[derive(Clone)]
 struct Repository {
-    // channels to get page data from db tasks
-    info_request_sender: Sender<PageInfoRequest>,
+    resource_request_sender: Sender<ResourceRequest>,
 }
 
 impl Repository {
-    fn new(info_request_sender: Sender<PageInfoRequest>) -> Repository {
+    fn new(resource_request_sender: Sender<ResourceRequest>) -> Repository {
         Repository {
-            info_request_sender,
+            resource_request_sender,
         }
     }
 
@@ -35,23 +34,23 @@ impl Repository {
         &self,
         path: &str,
     ) -> hyper::http::Result<Response<BoxBody<Bytes, Infallible>>> {
-        let (info_sender, info_receiver) = oneshot::channel();
-        let (body_stream_sender, mut body_stream_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (meta_sender, meta_receiver) = oneshot::channel();
+        let (body_sender, mut body_receiver) = tokio::sync::mpsc::unbounded_channel();
 
         let _ = &self
-            .info_request_sender
+            .resource_request_sender
             .clone()
-            .send_async(PageInfoRequest {
+            .send_async(ResourceRequest {
                 path: path.to_string(),
-                info_sender,
-                body_sender: body_stream_sender,
+                meta_sender,
+                body_sender,
             })
             .await;
 
         // TODO:
         // timeout here and at the other send points,
         // or somehow wrap the timeout around the caller of this function?
-        let page_response = timeout(Duration::from_secs(1), info_receiver).await;
+        let page_response = timeout(Duration::from_secs(1), meta_receiver).await;
 
         match page_response {
             Err(_elapsed) => Response::builder()
@@ -67,7 +66,7 @@ impl Repository {
                 .status(StatusCode::NOT_FOUND)
                 .body(BoxBody::default()),
             Ok(Ok(Ok(Some(info)))) => {
-                match body_stream_receiver.recv().await {
+                match body_receiver.recv().await {
                     None => {
                         // error, page exists but no content?
                         Response::builder()
@@ -101,7 +100,7 @@ impl Repository {
                                 let frame = Frame::data(bytes);
                                 yield Result::<Frame<Bytes>, Infallible>::Ok(frame);
 
-                                next_block = body_stream_receiver.recv().await;
+                                next_block = body_receiver.recv().await;
                             }
                         };
 
@@ -143,15 +142,15 @@ async fn main() {
     // so that
     const DB_INFLIGHT_COUNT: usize = 4;
 
-    let (info_request_sender, info_request_receiver) =
-        flume::bounded::<PageInfoRequest>(DB_INFLIGHT_COUNT);
+    let (resource_request_sender, resource_request_receiver) =
+        flume::bounded::<ResourceRequest>(DB_INFLIGHT_COUNT);
 
-    let repository = Repository::new(info_request_sender);
+    let repository = Repository::new(resource_request_sender);
 
     const DB_RECEIVER_COUNT: i32 = 2;
     for i in 0..DB_RECEIVER_COUNT {
-        let r = info_request_receiver.clone();
-        let _ = spawn_blocking(move || db::db_read_page_infos_task(i, r));
+        let r = resource_request_receiver.clone();
+        let _ = spawn_blocking(move || db::send_resources_for_path_task(i, r));
     }
 
     // We'll bind to 127.0.0.1:8080

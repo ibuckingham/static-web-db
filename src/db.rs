@@ -8,20 +8,20 @@ use tokio::sync::oneshot;
 
 const BLOCK_SIZE_BYTES: usize = 16 * 1024;
 
-pub struct PageInfoRequest {
+pub struct ResourceRequest {
     pub path: String,
-    pub info_sender: oneshot::Sender<rusqlite::Result<Option<PageInfo>>>,
+    pub meta_sender: oneshot::Sender<rusqlite::Result<Option<ResourceMeta>>>,
     pub body_sender: tokio::sync::mpsc::UnboundedSender<Box<[u8]>>,
 }
 
-pub struct PageInfo {
+pub struct ResourceMeta {
     pub content_type: String,
     pub content_length: usize,
     row_id: i64,
     last_modified_uxt: u64,
 }
 
-impl PageInfo {
+impl ResourceMeta {
     pub fn format_last_modified_timestamp(&self) -> String {
         let last_modified_systime =
             SystemTime::UNIX_EPOCH.add(Duration::from_secs(self.last_modified_uxt));
@@ -30,7 +30,10 @@ impl PageInfo {
     }
 }
 
-pub fn db_read_page_infos_task(_i: i32, info_request_receiver: flume::Receiver<PageInfoRequest>) {
+pub fn send_resources_for_path_task(
+    _i: i32,
+    resource_request_receiver: flume::Receiver<ResourceRequest>,
+) {
     let conn = Connection::open_with_flags(
         "site.db",
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -41,32 +44,32 @@ pub fn db_read_page_infos_task(_i: i32, info_request_receiver: flume::Receiver<P
         .prepare("select last_modified_uxt, content_type, rowid, length(body) as content_length from pages where path = ?")
         .expect("SQL statement prepared");
 
-    while let Ok(request) = info_request_receiver.recv() {
+    while let Ok(request) = resource_request_receiver.recv() {
         // println!("info from {i}");
         handle_resource_request(&conn, &mut stmt, request);
     }
 }
 
-fn handle_resource_request(conn: &Connection, mut stmt: &mut Statement, request: PageInfoRequest) {
-    let page = get_page_info_from_database(&mut stmt, &request.path);
-    match page {
-        Ok(Some(info)) => {
-            let row_id = info.row_id;
-            let content_length = info.content_length;
+fn handle_resource_request(conn: &Connection, mut stmt: &mut Statement, request: ResourceRequest) {
+    let meta = get_meta_for_path(&mut stmt, &request.path);
+    match meta {
+        Ok(Some(meta)) => {
+            let row_id = meta.row_id;
+            let content_length = meta.content_length;
 
-            if request.info_sender.send(Ok(Some(info))).is_err() {
+            if request.meta_sender.send(Ok(Some(meta))).is_err() {
                 return;
             };
 
-            send_content_blocks(&conn, request.body_sender, row_id, content_length);
+            send_body_blocks(&conn, request.body_sender, row_id, content_length);
         }
         _ => {
-            let _ignore_dropped_receiver = request.info_sender.send(page);
+            let _ignore_dropped_receiver = request.meta_sender.send(meta);
         }
     }
 }
 
-fn send_content_blocks(
+fn send_body_blocks(
     conn: &Connection,
     sender: UnboundedSender<Box<[u8]>>,
     row_id: i64,
@@ -77,11 +80,11 @@ fn send_content_blocks(
     while next_start < content_length {
         let next_end = std::cmp::min(next_start + BLOCK_SIZE_BYTES, content_length);
         let byte_range = next_start..next_end;
-        let maybe_body = get_body_buf_from_db(conn, row_id, byte_range);
+        let maybe_body = get_body_range_for_row(conn, row_id, byte_range);
         match maybe_body {
-            Ok(body) => {
-                let actual_length = body.len();
-                if actual_length == 0 || sender.send(body).is_err() {
+            Ok(body_block) => {
+                let actual_length = body_block.len();
+                if actual_length == 0 || sender.send(body_block).is_err() {
                     // nothing listening, so stop sending
                     return;
                 };
@@ -98,17 +101,14 @@ fn send_content_blocks(
     }
 }
 
-fn get_page_info_from_database(
-    stmt: &mut Statement,
-    path: &str,
-) -> rusqlite::Result<Option<PageInfo>> {
+fn get_meta_for_path(stmt: &mut Statement, path: &str) -> rusqlite::Result<Option<ResourceMeta>> {
     stmt.query_row([path], |row| {
         let lm = row.get(0)?;
         let ct = row.get(1)?;
         let row_id = row.get(2)?;
         let content_length = row.get(3)?;
 
-        Ok(PageInfo {
+        Ok(ResourceMeta {
             last_modified_uxt: lm,
             content_type: ct,
             content_length,
@@ -118,7 +118,7 @@ fn get_page_info_from_database(
     .optional()
 }
 
-fn get_body_buf_from_db(
+fn get_body_range_for_row(
     conn: &Connection,
     row_id: i64,
     byte_range: Range<usize>,
