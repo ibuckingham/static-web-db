@@ -35,8 +35,8 @@ pub fn send_resources_for_path_task(
     resource_request_receiver: flume::Receiver<ResourceRequest>,
 ) {
     let conn = Connection::open_with_flags(
-        "site.db",
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        "file:site.db?immutable=1",
+        OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .expect("connect to db");
 
